@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use regex::Regex;
 use teloxide::prelude::*;
-use teloxide::types::InputFile;
+use teloxide::types::{InputFile, MessageId};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 #[tokio::main]
@@ -41,18 +43,22 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
         let url = m.as_str();
         let tmp_path = std::env::temp_dir().join(format!("{}.mp4", Uuid::new_v4()));
 
-        bot.send_message(msg.chat.id, "Downloading reel...")
-            .await?;
+        let status_msg = bot.send_message(msg.chat.id, "Downloading reel...").await?;
 
-        match download_reel(url, &tmp_path).await {
+        match download_with_progress(url, &tmp_path, &["-f", "mp4"], &bot, msg.chat.id, status_msg.id).await {
             Ok(()) => {
+                bot.edit_message_text(msg.chat.id, status_msg.id, "Sending video...")
+                    .await
+                    .ok();
                 if let Err(e) = send_video(&bot, msg.chat.id, &tmp_path).await {
-                    bot.send_message(msg.chat.id, format!("Failed to send video: {e}"))
+                    bot.edit_message_text(msg.chat.id, status_msg.id, format!("Failed to send video: {e}"))
                         .await?;
+                } else {
+                    bot.delete_message(msg.chat.id, status_msg.id).await.ok();
                 }
             }
             Err(e) => {
-                bot.send_message(msg.chat.id, format!("Download failed: {e}"))
+                bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
                     .await?;
             }
         }
@@ -62,18 +68,22 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
         let url = m.as_str();
         let tmp_path = std::env::temp_dir().join(format!("{}.mp3", Uuid::new_v4()));
 
-        bot.send_message(msg.chat.id, "Downloading audio...")
-            .await?;
+        let status_msg = bot.send_message(msg.chat.id, "Downloading audio...").await?;
 
-        match download_youtube_mp3(url, &tmp_path).await {
+        match download_with_progress(url, &tmp_path, &["-x", "--audio-format", "mp3"], &bot, msg.chat.id, status_msg.id).await {
             Ok(()) => {
+                bot.edit_message_text(msg.chat.id, status_msg.id, "Sending audio...")
+                    .await
+                    .ok();
                 if let Err(e) = send_audio(&bot, msg.chat.id, &tmp_path).await {
-                    bot.send_message(msg.chat.id, format!("Failed to send audio: {e}"))
+                    bot.edit_message_text(msg.chat.id, status_msg.id, format!("Failed to send audio: {e}"))
                         .await?;
+                } else {
+                    bot.delete_message(msg.chat.id, status_msg.id).await.ok();
                 }
             }
             Err(e) => {
-                bot.send_message(msg.chat.id, format!("Download failed: {e}"))
+                bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
                     .await?;
             }
         }
@@ -102,41 +112,50 @@ fn cookie_browser() -> &'static str {
     "chrome"
 }
 
-async fn download_reel(url: &str, output: &PathBuf) -> Result<(), String> {
-    let status = tokio::process::Command::new("yt-dlp")
+async fn download_with_progress(
+    url: &str,
+    output: &PathBuf,
+    format_args: &[&str],
+    bot: &Bot,
+    chat_id: ChatId,
+    msg_id: MessageId,
+) -> Result<(), String> {
+    let mut cmd = tokio::process::Command::new("yt-dlp");
+    cmd.args(format_args)
         .args([
-            "-f", "mp4",
+            "--newline",
             "--max-filesize", "50m",
             "--cookies-from-browser", cookie_browser(),
-            "-o",
-            output.to_str().unwrap(),
+            "-o", output.to_str().unwrap(),
             url,
         ])
-        .status()
-        .await
-        .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
-    if !status.success() {
-        return Err("yt-dlp exited with an error".into());
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout).lines();
+
+    let progress_re = Regex::new(r"\[download\]\s+(\d+\.?\d*%\s+.*)").unwrap();
+    let mut last_update = Instant::now();
+    let mut last_text = String::new();
+    let update_interval = Duration::from_secs(3);
+
+    while let Ok(Some(line)) = reader.next_line().await {
+        if let Some(caps) = progress_re.captures(&line) {
+            let progress = caps.get(1).unwrap().as_str().to_string();
+            // Throttle edits to avoid Telegram rate limits
+            if last_update.elapsed() >= update_interval && progress != last_text {
+                let display = format!("Downloading...\n{progress}");
+                bot.edit_message_text(chat_id, msg_id, &display).await.ok();
+                last_text = progress;
+                last_update = Instant::now();
+            }
+        }
     }
 
-    Ok(())
-}
-
-async fn download_youtube_mp3(url: &str, output: &PathBuf) -> Result<(), String> {
-    let status = tokio::process::Command::new("yt-dlp")
-        .args([
-            "-x",
-            "--audio-format", "mp3",
-            "--max-filesize", "50m",
-            "--cookies-from-browser", cookie_browser(),
-            "-o",
-            output.to_str().unwrap(),
-            url,
-        ])
-        .status()
-        .await
-        .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+    let status = child.wait().await.map_err(|e| format!("yt-dlp error: {e}"))?;
 
     if !status.success() {
         return Err("yt-dlp exited with an error".into());

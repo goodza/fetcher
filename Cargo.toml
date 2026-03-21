@@ -1,0 +1,15 @@
+[package]
+name = "fetcher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+teloxide = { version = "0.17", features = ["macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
+log = "0.4"
+pretty_env_logger = "0.5"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+dotenvy = "0.15"
+reqwest = "0.12"
+dirs = "6"

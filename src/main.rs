@@ -134,6 +134,14 @@ async fn download_with_progress(
 
     let mut child = cmd.spawn().map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
 
+    let stderr = child.stderr.take().unwrap();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            log::warn!("[yt-dlp stderr] {}", line);
+        }
+    });
+
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout).lines();
 
@@ -143,6 +151,7 @@ async fn download_with_progress(
     let update_interval = Duration::from_secs(3);
 
     while let Ok(Some(line)) = reader.next_line().await {
+        log::info!("[yt-dlp] {}", line);
         if let Some(caps) = progress_re.captures(&line) {
             let progress = caps.get(1).unwrap().as_str().to_string();
             // Throttle edits to avoid Telegram rate limits

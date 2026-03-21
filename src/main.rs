@@ -124,7 +124,6 @@ async fn download_with_progress(
     cmd.args(format_args)
         .args([
             "--newline",
-            "--max-filesize", "50m",
             "--cookies-from-browser", cookie_browser(),
             "-o", output.to_str().unwrap(),
             url,
@@ -173,18 +172,30 @@ async fn download_with_progress(
     Ok(())
 }
 
+const MAX_TG_SIZE: u64 = 49 * 1024 * 1024;
+
 async fn send_audio(bot: &Bot, chat_id: ChatId, path: &PathBuf) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
-    if metadata.len() > 50 * 1024 * 1024 {
-        return Err("Audio exceeds Telegram's 50 MB limit".into());
+    if metadata.len() <= MAX_TG_SIZE {
+        bot.send_audio(chat_id, InputFile::file(path))
+            .await
+            .map_err(|e| format!("Telegram API error: {e}"))?;
+        return Ok(());
     }
 
-    bot.send_audio(chat_id, InputFile::file(path))
-        .await
-        .map_err(|e| format!("Telegram API error: {e}"))?;
+    let chunks = split_media(path, "mp3").await?;
+    for (i, chunk) in chunks.iter().enumerate() {
+        log::info!("Sending audio chunk {}/{}", i + 1, chunks.len());
+        bot.send_audio(chat_id, InputFile::file(chunk))
+            .await
+            .map_err(|e| format!("Telegram API error on chunk {}: {e}", i + 1))?;
+    }
+    for chunk in &chunks {
+        let _ = tokio::fs::remove_file(chunk).await;
+    }
 
     Ok(())
 }
@@ -194,13 +205,96 @@ async fn send_video(bot: &Bot, chat_id: ChatId, path: &PathBuf) -> Result<(), St
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
-    if metadata.len() > 50 * 1024 * 1024 {
-        return Err("Video exceeds Telegram's 50 MB limit".into());
+    if metadata.len() <= MAX_TG_SIZE {
+        bot.send_video(chat_id, InputFile::file(path))
+            .await
+            .map_err(|e| format!("Telegram API error: {e}"))?;
+        return Ok(());
     }
 
-    bot.send_video(chat_id, InputFile::file(path))
-        .await
-        .map_err(|e| format!("Telegram API error: {e}"))?;
+    let chunks = split_media(path, "mp4").await?;
+    for (i, chunk) in chunks.iter().enumerate() {
+        log::info!("Sending video chunk {}/{}", i + 1, chunks.len());
+        bot.send_video(chat_id, InputFile::file(chunk))
+            .await
+            .map_err(|e| format!("Telegram API error on chunk {}: {e}", i + 1))?;
+    }
+    for chunk in &chunks {
+        let _ = tokio::fs::remove_file(chunk).await;
+    }
 
     Ok(())
+}
+
+async fn split_media(path: &PathBuf, ext: &str) -> Result<Vec<PathBuf>, String> {
+    let file_size = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("Cannot read file: {e}"))?
+        .len();
+
+    let num_chunks = (file_size / MAX_TG_SIZE) + 1;
+
+    // Get total duration via ffprobe
+    let probe = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ffprobe: {e}"))?;
+
+    let duration_str = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    let total_duration: f64 = duration_str
+        .parse()
+        .map_err(|_| format!("Failed to parse duration: {duration_str}"))?;
+
+    let chunk_duration = total_duration / num_chunks as f64;
+    let dir = path.parent().unwrap();
+    let stem = Uuid::new_v4();
+
+    let pattern = dir.join(format!("{stem}_%03d.{ext}"));
+
+    log::info!(
+        "Splitting {:.1}MB file into {} chunks of ~{:.0}s each",
+        file_size as f64 / 1024.0 / 1024.0,
+        num_chunks,
+        chunk_duration
+    );
+
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-i", path.to_str().unwrap(),
+            "-f", "segment",
+            "-segment_time", &format!("{chunk_duration:.2}"),
+            "-c", "copy",
+            "-reset_timestamps", "1",
+            pattern.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
+
+    if !status.success() {
+        return Err("ffmpeg split failed".into());
+    }
+
+    // Collect generated chunk files
+    let mut chunks = Vec::new();
+    for i in 0u32.. {
+        let chunk_path = dir.join(format!("{stem}_{:03}.{ext}", i));
+        if chunk_path.exists() {
+            chunks.push(chunk_path);
+        } else {
+            break;
+        }
+    }
+
+    if chunks.is_empty() {
+        return Err("No chunks produced by ffmpeg".into());
+    }
+
+    Ok(chunks)
 }

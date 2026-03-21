@@ -48,12 +48,14 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
 
         let status_msg = bot.send_message(msg.chat.id, "Downloading reel...").await?;
 
+        let title = fetch_title(url).await.unwrap_or_else(|| "video".into());
+
         match download_with_progress(url, &tmp_path, &["-f", "mp4"], &bot, msg.chat.id, status_msg.id).await {
             Ok(()) => {
                 bot.edit_message_text(msg.chat.id, status_msg.id, "Sending video...")
                     .await
                     .ok();
-                if let Err(e) = send_video(&bot, msg.chat.id, &tmp_path).await {
+                if let Err(e) = send_video(&bot, msg.chat.id, &tmp_path, &title).await {
                     bot.edit_message_text(msg.chat.id, status_msg.id, format!("Failed to send video: {e}"))
                         .await?;
                 } else {
@@ -73,12 +75,14 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
 
         let status_msg = bot.send_message(msg.chat.id, "Downloading audio...").await?;
 
+        let title = fetch_title(url).await.unwrap_or_else(|| "audio".into());
+
         match download_with_progress(url, &tmp_path, &["-x", "--audio-format", "mp3"], &bot, msg.chat.id, status_msg.id).await {
             Ok(()) => {
                 bot.edit_message_text(msg.chat.id, status_msg.id, "Sending audio...")
                     .await
                     .ok();
-                if let Err(e) = send_audio(&bot, msg.chat.id, &tmp_path).await {
+                if let Err(e) = send_audio(&bot, msg.chat.id, &tmp_path, &title).await {
                     bot.edit_message_text(msg.chat.id, status_msg.id, format!("Failed to send audio: {e}"))
                         .await?;
                 } else {
@@ -175,15 +179,26 @@ async fn download_with_progress(
     Ok(())
 }
 
+async fn fetch_title(url: &str) -> Option<String> {
+    let output = tokio::process::Command::new("yt-dlp")
+        .args(["--print", "title", "--no-download", "--cookies-from-browser", cookie_browser(), url])
+        .output()
+        .await
+        .ok()?;
+    let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if title.is_empty() { None } else { Some(title) }
+}
+
 const MAX_TG_SIZE: u64 = 49 * 1024 * 1024;
 
-async fn send_audio(bot: &Bot, chat_id: ChatId, path: &PathBuf) -> Result<(), String> {
+async fn send_audio(bot: &Bot, chat_id: ChatId, path: &PathBuf, title: &str) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
     if metadata.len() <= MAX_TG_SIZE {
-        bot.send_audio(chat_id, InputFile::file(path))
+        let file = InputFile::file(path).file_name(format!("{title}.mp3"));
+        bot.send_audio(chat_id, file)
             .await
             .map_err(|e| format!("Telegram API error: {e}"))?;
         return Ok(());
@@ -192,7 +207,13 @@ async fn send_audio(bot: &Bot, chat_id: ChatId, path: &PathBuf) -> Result<(), St
     let chunks = split_media(path, "mp3").await?;
     for (i, chunk) in chunks.iter().enumerate() {
         log::info!("Sending audio chunk {}/{}", i + 1, chunks.len());
-        bot.send_audio(chat_id, InputFile::file(chunk))
+        let label = if chunks.len() > 1 {
+            format!("{title} (part {})", i + 1)
+        } else {
+            title.to_string()
+        };
+        let file = InputFile::file(chunk).file_name(format!("{label}.mp3"));
+        bot.send_audio(chat_id, file)
             .await
             .map_err(|e| format!("Telegram API error on chunk {}: {e}", i + 1))?;
     }
@@ -203,13 +224,14 @@ async fn send_audio(bot: &Bot, chat_id: ChatId, path: &PathBuf) -> Result<(), St
     Ok(())
 }
 
-async fn send_video(bot: &Bot, chat_id: ChatId, path: &PathBuf) -> Result<(), String> {
+async fn send_video(bot: &Bot, chat_id: ChatId, path: &PathBuf, title: &str) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
     if metadata.len() <= MAX_TG_SIZE {
-        bot.send_video(chat_id, InputFile::file(path))
+        let file = InputFile::file(path).file_name(format!("{title}.mp4"));
+        bot.send_video(chat_id, file)
             .await
             .map_err(|e| format!("Telegram API error: {e}"))?;
         return Ok(());
@@ -218,7 +240,13 @@ async fn send_video(bot: &Bot, chat_id: ChatId, path: &PathBuf) -> Result<(), St
     let chunks = split_media(path, "mp4").await?;
     for (i, chunk) in chunks.iter().enumerate() {
         log::info!("Sending video chunk {}/{}", i + 1, chunks.len());
-        bot.send_video(chat_id, InputFile::file(chunk))
+        let label = if chunks.len() > 1 {
+            format!("{title} (part {})", i + 1)
+        } else {
+            title.to_string()
+        };
+        let file = InputFile::file(chunk).file_name(format!("{label}.mp4"));
+        bot.send_video(chat_id, file)
             .await
             .map_err(|e| format!("Telegram API error on chunk {}: {e}", i + 1))?;
     }

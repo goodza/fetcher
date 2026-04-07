@@ -132,6 +132,7 @@ async fn download_with_progress(
         .args([
             "--newline",
             "--cookies-from-browser", cookie_browser(),
+            "--remote-components", "ejs:github",
             "-o", output.to_str().unwrap(),
             url,
         ])
@@ -181,7 +182,7 @@ async fn download_with_progress(
 
 async fn fetch_title(url: &str) -> Option<String> {
     let output = tokio::process::Command::new("yt-dlp")
-        .args(["--print", "title", "--no-download", "--cookies-from-browser", cookie_browser(), url])
+        .args(["--print", "title", "--no-download", "--cookies-from-browser", cookie_browser(), "--remote-components", "ejs:github", url])
         .output()
         .await
         .ok()?;

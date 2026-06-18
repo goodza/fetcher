@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use regex::Regex;
@@ -16,6 +16,7 @@ async fn main() {
     }
     pretty_env_logger::init();
     log::info!("Starting fetcher bot...");
+    check_cookies().await;
 
     let token = std::env::var("TG_TOKEN").expect("TG_TOKEN must be set");
     let client = reqwest::Client::builder()
@@ -33,7 +34,7 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
         None => return Ok(()),
     };
 
-    if let Some(user) = msg.from() {
+    if let Some(user) = msg.from.as_ref() {
         log::info!("Message from user id: {}", user.id);
     }
 
@@ -119,9 +120,84 @@ fn cookie_browser() -> &'static str {
     "chrome"
 }
 
+fn add_cookie_args(cmd: &mut tokio::process::Command) {
+    cmd.env_remove("NODE_APP_INSTANCE")
+        .env_remove("NODE_CHANNEL_FD")
+        .env_remove("NODE_CHANNEL_SERIALIZATION_MODE");
+
+    if let Some(path) = cookie_file_path() {
+        cmd.arg("--cookies").arg(path);
+    } else {
+        cmd.args(["--cookies-from-browser", cookie_browser()]);
+    }
+}
+
+fn cookie_file_path() -> Option<PathBuf> {
+    let cwd_path = PathBuf::from("cookies.txt");
+    if cwd_path.exists() {
+        return std::fs::canonicalize(cwd_path).ok();
+    }
+
+    let exe_path = std::env::current_exe().ok()?;
+    let exe_dir = exe_path.parent()?;
+    let exe_cookie_path = exe_dir.join("cookies.txt");
+    if exe_cookie_path.exists() {
+        std::fs::canonicalize(exe_cookie_path).ok()
+    } else {
+        None
+    }
+}
+
+async fn check_cookies() {
+    const CHECK_URL: &str = "https://www.youtube.com/watch?v=Sv5ZZB-M59Q";
+
+    match cookie_file_path() {
+        Some(path) => log::info!("Checking yt-dlp cookies from {}", path.display()),
+        None => log::info!("Checking yt-dlp cookies from browser: {}", cookie_browser()),
+    }
+
+    let mut cmd = tokio::process::Command::new("yt-dlp");
+    cmd.args([
+        "--print",
+        "title",
+        "--no-download",
+        "--js-runtimes",
+        "node",
+        "--remote-components",
+        "ejs:github",
+        "--verbose",
+        CHECK_URL,
+    ]);
+    add_cookie_args(&mut cmd);
+
+    match cmd.output().await {
+        Ok(output) if output.status.success() => {
+            let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            log::info!("yt-dlp cookie check OK: {title}");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for line in stderr.lines().filter(|line| {
+                line.contains("JS runtimes")
+                    || line.contains("jsc:")
+                    || line.contains("cookies")
+                    || line.contains("WARNING")
+                    || line.contains("ERROR")
+            }) {
+                log::warn!("yt-dlp cookie check detail: {line}");
+            }
+            let details = stderr.lines().last().unwrap_or("yt-dlp exited with an error");
+            log::error!("yt-dlp cookie check failed: {details}");
+        }
+        Err(e) => {
+            log::error!("yt-dlp cookie check failed to run: {e}");
+        }
+    }
+}
+
 async fn download_with_progress(
     url: &str,
-    output: &PathBuf,
+    output: &Path,
     format_args: &[&str],
     bot: &Bot,
     chat_id: ChatId,
@@ -131,12 +207,13 @@ async fn download_with_progress(
     cmd.args(format_args)
         .args([
             "--newline",
-            "--cookies-from-browser", cookie_browser(),
+            "--js-runtimes", "node",
             "--remote-components", "ejs:github",
             "-o", output.to_str().unwrap(),
             url,
-        ])
-        .stdout(std::process::Stdio::piped())
+        ]);
+    add_cookie_args(&mut cmd);
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
@@ -153,6 +230,7 @@ async fn download_with_progress(
     let mut reader = BufReader::new(stdout).lines();
 
     let progress_re = Regex::new(r"\[download\]\s+(\d+\.?\d*%\s+.*)").unwrap();
+    let extract_re = Regex::new(r"\[(?:ExtractAudio|ffmpeg)\]\s+(.+)$").unwrap();
     let mut last_update = Instant::now();
     let mut last_text = String::new();
     let update_interval = Duration::from_secs(3);
@@ -161,11 +239,18 @@ async fn download_with_progress(
         log::info!("[yt-dlp] {}", line);
         if let Some(caps) = progress_re.captures(&line) {
             let progress = caps.get(1).unwrap().as_str().to_string();
-            // Throttle edits to avoid Telegram rate limits
             if last_update.elapsed() >= update_interval && progress != last_text {
                 let display = format!("Downloading...\n{progress}");
                 bot.edit_message_text(chat_id, msg_id, &display).await.ok();
                 last_text = progress;
+                last_update = Instant::now();
+            }
+        } else if let Some(caps) = extract_re.captures(&line) {
+            let text = caps.get(1).unwrap().as_str().to_string();
+            if last_update.elapsed() >= update_interval && text != last_text {
+                let display = format!("Converting...\n{text}");
+                bot.edit_message_text(chat_id, msg_id, &display).await.ok();
+                last_text = text;
                 last_update = Instant::now();
             }
         }
@@ -181,8 +266,10 @@ async fn download_with_progress(
 }
 
 async fn fetch_title(url: &str) -> Option<String> {
-    let output = tokio::process::Command::new("yt-dlp")
-        .args(["--print", "title", "--no-download", "--cookies-from-browser", cookie_browser(), "--remote-components", "ejs:github", url])
+    let mut cmd = tokio::process::Command::new("yt-dlp");
+    cmd.args(["--print", "title", "--no-download", "--js-runtimes", "node", "--remote-components", "ejs:github", url]);
+    add_cookie_args(&mut cmd);
+    let output = cmd
         .output()
         .await
         .ok()?;
@@ -192,7 +279,7 @@ async fn fetch_title(url: &str) -> Option<String> {
 
 const MAX_TG_SIZE: u64 = 49 * 1024 * 1024;
 
-async fn send_audio(bot: &Bot, chat_id: ChatId, path: &PathBuf, title: &str) -> Result<(), String> {
+async fn send_audio(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
@@ -225,7 +312,7 @@ async fn send_audio(bot: &Bot, chat_id: ChatId, path: &PathBuf, title: &str) -> 
     Ok(())
 }
 
-async fn send_video(bot: &Bot, chat_id: ChatId, path: &PathBuf, title: &str) -> Result<(), String> {
+async fn send_video(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
@@ -258,7 +345,7 @@ async fn send_video(bot: &Bot, chat_id: ChatId, path: &PathBuf, title: &str) -> 
     Ok(())
 }
 
-async fn split_media(path: &PathBuf, ext: &str) -> Result<Vec<PathBuf>, String> {
+async fn split_media(path: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
     let file_size = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read file: {e}"))?

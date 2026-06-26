@@ -1,10 +1,17 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use teloxide::prelude::*;
-use teloxide::types::{InputFile, MessageId};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use teloxide::types::{
+    InlineQueryResult, InlineQueryResultArticle, InputFile, InputMessageContent,
+    InputMessageContentText, MessageId,
+};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -25,7 +32,103 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP client");
     let bot = Bot::with_client(token, client);
-    teloxide::repl(bot, handle_message).await;
+    let handler = dptree::entry()
+        .branch(Update::filter_message().endpoint(handle_message))
+        .branch(Update::filter_inline_query().endpoint(handle_inline_query));
+
+    Dispatcher::builder(bot, handler)
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+}
+
+#[derive(Clone, Copy)]
+enum DownloadKind {
+    InstagramReel,
+    YouTubeShort,
+    YouTubeAudio,
+}
+
+impl DownloadKind {
+    fn inline_title(self) -> &'static str {
+        match self {
+            Self::InstagramReel => "Instagram Reel",
+            Self::YouTubeShort => "YouTube Short",
+            Self::YouTubeAudio => "YouTube audio",
+        }
+    }
+
+    fn inline_description(self) -> &'static str {
+        match self {
+            Self::InstagramReel => "Share this Reel link from inline mode",
+            Self::YouTubeShort => "Share this Short link from inline mode",
+            Self::YouTubeAudio => "Share this YouTube link from inline mode",
+        }
+    }
+}
+
+struct DownloadLink<'a> {
+    kind: DownloadKind,
+    url: &'a str,
+}
+
+fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
+    let ig_re =
+        Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_-]+").unwrap();
+    let yt_shorts_re =
+        Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)").unwrap();
+    let yt_re = Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/watch\?[^\s]*v=[A-Za-z0-9_-]+|youtu\.be/[A-Za-z0-9_-]+)")
+        .unwrap();
+
+    if let Some(m) = ig_re.find(text) {
+        Some(DownloadLink {
+            kind: DownloadKind::InstagramReel,
+            url: m.as_str(),
+        })
+    } else if let Some(m) = yt_shorts_re.find(text) {
+        Some(DownloadLink {
+            kind: DownloadKind::YouTubeShort,
+            url: m.as_str(),
+        })
+    } else if let Some(m) = yt_re.find(text) {
+        Some(DownloadLink {
+            kind: DownloadKind::YouTubeAudio,
+            url: m.as_str(),
+        })
+    } else {
+        None
+    }
+}
+
+async fn handle_inline_query(bot: Bot, q: InlineQuery) -> ResponseResult<()> {
+    let results = if let Some(link) = find_download_link(&q.query) {
+        vec![InlineQueryResult::Article(
+            InlineQueryResultArticle::new(
+                "download-link".to_string(),
+                format!("Send {} link", link.kind.inline_title()),
+                InputMessageContent::Text(InputMessageContentText::new(link.url.to_string())),
+            )
+            .description(link.kind.inline_description()),
+        )]
+    } else {
+        vec![InlineQueryResult::Article(
+            InlineQueryResultArticle::new(
+                "help".to_string(),
+                "Paste an Instagram Reel or YouTube link",
+                InputMessageContent::Text(InputMessageContentText::new(
+                    "Paste an Instagram Reel, YouTube Short, or YouTube watch link after the bot username.",
+                )),
+            )
+            .description("Example: @fetcher_bot https://www.instagram.com/reel/..."),
+        )]
+    };
+
+    bot.answer_inline_query(q.id, results)
+        .cache_time(0)
+        .is_personal(true)
+        .await?;
+    Ok(())
 }
 
 async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
@@ -38,8 +141,10 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
         log::info!("Message from user id: {}", user.id);
     }
 
-    let ig_re = Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_-]+")
-        .unwrap();
+    let ig_re =
+        Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_-]+").unwrap();
+    let yt_shorts_re =
+        Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)").unwrap();
     let yt_re = Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/watch\?[^\s]*v=[A-Za-z0-9_-]+|youtu\.be/[A-Za-z0-9_-]+)")
         .unwrap();
 
@@ -47,18 +152,77 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
         let url = m.as_str();
         let tmp_path = std::env::temp_dir().join(format!("{}.mp4", Uuid::new_v4()));
 
+        log_download_link("instagram", url, &msg).await;
+
         let status_msg = bot.send_message(msg.chat.id, "Downloading reel...").await?;
 
         let title = fetch_title(url).await.unwrap_or_else(|| "video".into());
 
-        match download_with_progress(url, &tmp_path, &["-f", "mp4"], &bot, msg.chat.id, status_msg.id).await {
+        match download_with_progress(
+            url,
+            &tmp_path,
+            &["-f", "mp4"],
+            &bot,
+            msg.chat.id,
+            status_msg.id,
+        )
+        .await
+        {
             Ok(()) => {
                 bot.edit_message_text(msg.chat.id, status_msg.id, "Sending video...")
                     .await
                     .ok();
                 if let Err(e) = send_video(&bot, msg.chat.id, &tmp_path, &title).await {
-                    bot.edit_message_text(msg.chat.id, status_msg.id, format!("Failed to send video: {e}"))
-                        .await?;
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        status_msg.id,
+                        format!("Failed to send video: {e}"),
+                    )
+                    .await?;
+                } else {
+                    bot.delete_message(msg.chat.id, status_msg.id).await.ok();
+                }
+            }
+            Err(e) => {
+                bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
+                    .await?;
+            }
+        }
+
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    } else if let Some(m) = yt_shorts_re.find(text) {
+        let url = m.as_str();
+        let tmp_path = std::env::temp_dir().join(format!("{}.mp4", Uuid::new_v4()));
+
+        log_download_link("youtube_shorts", url, &msg).await;
+
+        let status_msg = bot
+            .send_message(msg.chat.id, "Downloading short...")
+            .await?;
+
+        let title = fetch_title(url).await.unwrap_or_else(|| "video".into());
+
+        match download_with_progress(
+            url,
+            &tmp_path,
+            &["-f", "mp4"],
+            &bot,
+            msg.chat.id,
+            status_msg.id,
+        )
+        .await
+        {
+            Ok(()) => {
+                bot.edit_message_text(msg.chat.id, status_msg.id, "Sending video...")
+                    .await
+                    .ok();
+                if let Err(e) = send_video(&bot, msg.chat.id, &tmp_path, &title).await {
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        status_msg.id,
+                        format!("Failed to send video: {e}"),
+                    )
+                    .await?;
                 } else {
                     bot.delete_message(msg.chat.id, status_msg.id).await.ok();
                 }
@@ -74,18 +238,35 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
         let url = m.as_str();
         let tmp_path = std::env::temp_dir().join(format!("{}.mp3", Uuid::new_v4()));
 
-        let status_msg = bot.send_message(msg.chat.id, "Downloading audio...").await?;
+        log_download_link("youtube", url, &msg).await;
+
+        let status_msg = bot
+            .send_message(msg.chat.id, "Downloading audio...")
+            .await?;
 
         let title = fetch_title(url).await.unwrap_or_else(|| "audio".into());
 
-        match download_with_progress(url, &tmp_path, &["-x", "--audio-format", "mp3"], &bot, msg.chat.id, status_msg.id).await {
+        match download_with_progress(
+            url,
+            &tmp_path,
+            &["-x", "--audio-format", "mp3"],
+            &bot,
+            msg.chat.id,
+            status_msg.id,
+        )
+        .await
+        {
             Ok(()) => {
                 bot.edit_message_text(msg.chat.id, status_msg.id, "Sending audio...")
                     .await
                     .ok();
                 if let Err(e) = send_audio(&bot, msg.chat.id, &tmp_path, &title).await {
-                    bot.edit_message_text(msg.chat.id, status_msg.id, format!("Failed to send audio: {e}"))
-                        .await?;
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        status_msg.id,
+                        format!("Failed to send audio: {e}"),
+                    )
+                    .await?;
                 } else {
                     bot.delete_message(msg.chat.id, status_msg.id).await.ok();
                 }
@@ -100,6 +281,36 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
     }
 
     Ok(())
+}
+
+async fn log_download_link(kind: &str, url: &str, msg: &Message) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let user_id = msg
+        .from
+        .as_ref()
+        .map(|user| user.id.0.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let line = format!(
+        "{ts}\t{kind}\tchat={}\tuser={}\t{url}\n",
+        msg.chat.id, user_id
+    );
+
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("download_links.log")
+        .await
+    {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(line.as_bytes()).await {
+                log::warn!("Failed to write download_links.log: {e}");
+            }
+        }
+        Err(e) => log::warn!("Failed to open download_links.log: {e}"),
+    }
 }
 
 fn cookie_browser() -> &'static str {
@@ -186,7 +397,10 @@ async fn check_cookies() {
             }) {
                 log::warn!("yt-dlp cookie check detail: {line}");
             }
-            let details = stderr.lines().last().unwrap_or("yt-dlp exited with an error");
+            let details = stderr
+                .lines()
+                .last()
+                .unwrap_or("yt-dlp exited with an error");
             log::error!("yt-dlp cookie check failed: {details}");
         }
         Err(e) => {
@@ -204,25 +418,41 @@ async fn download_with_progress(
     msg_id: MessageId,
 ) -> Result<(), String> {
     let mut cmd = tokio::process::Command::new("yt-dlp");
-    cmd.args(format_args)
-        .args([
-            "--newline",
-            "--js-runtimes", "node",
-            "--remote-components", "ejs:github",
-            "-o", output.to_str().unwrap(),
-            url,
-        ]);
+    cmd.args(format_args).args([
+        "--newline",
+        "--js-runtimes",
+        "node",
+        "--remote-components",
+        "ejs:github",
+        "-o",
+        output.to_str().unwrap(),
+        url,
+    ]);
     add_cookie_args(&mut cmd);
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+
+    let extract_notified = Arc::new(AtomicBool::new(false));
 
     let stderr = child.stderr.take().unwrap();
+    let stderr_bot = bot.clone();
+    let stderr_extract_notified = Arc::clone(&extract_notified);
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             log::warn!("[yt-dlp stderr] {}", line);
+            if line.contains("[ExtractAudio]")
+                && !stderr_extract_notified.swap(true, Ordering::Relaxed)
+            {
+                stderr_bot
+                    .edit_message_text(chat_id, msg_id, "Extracting audio...")
+                    .await
+                    .ok();
+            }
         }
     });
 
@@ -247,7 +477,13 @@ async fn download_with_progress(
             }
         } else if let Some(caps) = extract_re.captures(&line) {
             let text = caps.get(1).unwrap().as_str().to_string();
-            if last_update.elapsed() >= update_interval && text != last_text {
+            if line.contains("[ExtractAudio]") && !extract_notified.swap(true, Ordering::Relaxed) {
+                bot.edit_message_text(chat_id, msg_id, "Extracting audio...")
+                    .await
+                    .ok();
+                last_text = text;
+                last_update = Instant::now();
+            } else if last_update.elapsed() >= update_interval && text != last_text {
                 let display = format!("Converting...\n{text}");
                 bot.edit_message_text(chat_id, msg_id, &display).await.ok();
                 last_text = text;
@@ -256,7 +492,10 @@ async fn download_with_progress(
         }
     }
 
-    let status = child.wait().await.map_err(|e| format!("yt-dlp error: {e}"))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("yt-dlp error: {e}"))?;
 
     if !status.success() {
         return Err("yt-dlp exited with an error".into());
@@ -267,14 +506,24 @@ async fn download_with_progress(
 
 async fn fetch_title(url: &str) -> Option<String> {
     let mut cmd = tokio::process::Command::new("yt-dlp");
-    cmd.args(["--print", "title", "--no-download", "--js-runtimes", "node", "--remote-components", "ejs:github", url]);
+    cmd.args([
+        "--print",
+        "title",
+        "--no-download",
+        "--js-runtimes",
+        "node",
+        "--remote-components",
+        "ejs:github",
+        url,
+    ]);
     add_cookie_args(&mut cmd);
-    let output = cmd
-        .output()
-        .await
-        .ok()?;
+    let output = cmd.output().await.ok()?;
     let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if title.is_empty() { None } else { Some(title) }
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
 }
 
 const MAX_TG_SIZE: u64 = 49 * 1024 * 1024;
@@ -356,9 +605,12 @@ async fn split_media(path: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
     // Get total duration via ffprobe
     let probe = tokio::process::Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             path.to_str().unwrap(),
         ])
         .output()
@@ -385,11 +637,16 @@ async fn split_media(path: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
 
     let status = tokio::process::Command::new("ffmpeg")
         .args([
-            "-i", path.to_str().unwrap(),
-            "-f", "segment",
-            "-segment_time", &format!("{chunk_duration:.2}"),
-            "-c", "copy",
-            "-reset_timestamps", "1",
+            "-i",
+            path.to_str().unwrap(),
+            "-f",
+            "segment",
+            "-segment_time",
+            &format!("{chunk_duration:.2}"),
+            "-c",
+            "copy",
+            "-reset_timestamps",
+            "1",
             pattern.to_str().unwrap(),
         ])
         .status()

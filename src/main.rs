@@ -1,19 +1,23 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineQueryResult, InlineQueryResultArticle, InputFile, InputMessageContent,
-    InputMessageContentText, MessageId,
+    InlineQueryResult, InlineQueryResultArticle, InlineQueryResultCachedVideo, InputFile,
+    InputMessageContent, InputMessageContentText, MessageId, UserId,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
 use uuid::Uuid;
+
+const DOWNLOAD_COOLDOWN: Duration = Duration::from_secs(60);
+type DownloadLimiter = Arc<Mutex<HashMap<UserId, Instant>>>;
 
 #[tokio::main]
 async fn main() {
@@ -32,11 +36,13 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP client");
     let bot = Bot::with_client(token, client);
+    let limiter: DownloadLimiter = Arc::new(Mutex::new(HashMap::new()));
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handle_message))
         .branch(Update::filter_inline_query().endpoint(handle_inline_query));
 
     Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![limiter])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -59,12 +65,8 @@ impl DownloadKind {
         }
     }
 
-    fn inline_description(self) -> &'static str {
-        match self {
-            Self::InstagramReel => "Share this Reel link from inline mode",
-            Self::YouTubeShort => "Share this Short link from inline mode",
-            Self::YouTubeAudio => "Share this YouTube link from inline mode",
-        }
+    fn is_inline_video(self) -> bool {
+        matches!(self, Self::InstagramReel | Self::YouTubeShort)
     }
 }
 
@@ -101,26 +103,59 @@ fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
     }
 }
 
-async fn handle_inline_query(bot: Bot, q: InlineQuery) -> ResponseResult<()> {
+fn check_download_limit(limiter: &DownloadLimiter, user_id: UserId) -> Result<(), u64> {
+    let now = Instant::now();
+    let mut downloads = limiter.lock().expect("download limiter lock poisoned");
+
+    if let Some(last_download) = downloads.get(&user_id) {
+        let elapsed = last_download.elapsed();
+        if elapsed < DOWNLOAD_COOLDOWN {
+            return Err((DOWNLOAD_COOLDOWN - elapsed).as_secs().max(1));
+        }
+    }
+
+    downloads.insert(user_id, now);
+    Ok(())
+}
+
+async fn handle_inline_query(
+    bot: Bot,
+    q: InlineQuery,
+    limiter: DownloadLimiter,
+) -> ResponseResult<()> {
     let results = if let Some(link) = find_download_link(&q.query) {
-        vec![InlineQueryResult::Article(
-            InlineQueryResultArticle::new(
-                "download-link".to_string(),
-                format!("Send {} link", link.kind.inline_title()),
-                InputMessageContent::Text(InputMessageContentText::new(link.url.to_string())),
-            )
-            .description(link.kind.inline_description()),
-        )]
+        if link.kind.is_inline_video() {
+            match check_download_limit(&limiter, q.from.id) {
+                Ok(()) => match prepare_inline_video(&bot, &q, &link).await {
+                    Ok(result) => vec![InlineQueryResult::CachedVideo(result)],
+                    Err(e) => vec![inline_article(
+                        "error",
+                        "Failed to prepare video",
+                        format!("Failed to prepare inline video: {e}"),
+                        "Try sending the link directly to the bot chat.",
+                    )],
+                },
+                Err(wait_secs) => vec![inline_article(
+                    "rate-limited",
+                    "Wait before next download",
+                    format!("Please wait {wait_secs}s before starting another download."),
+                    "Limit: 1 download per minute per user.",
+                )],
+            }
+        } else {
+            vec![inline_article(
+                "audio-not-supported",
+                "Inline video mode needs a video link",
+                link.url.to_string(),
+                "YouTube watch links are still handled as audio in bot chat.",
+            )]
+        }
     } else {
-        vec![InlineQueryResult::Article(
-            InlineQueryResultArticle::new(
-                "help".to_string(),
-                "Paste an Instagram Reel or YouTube link",
-                InputMessageContent::Text(InputMessageContentText::new(
-                    "Paste an Instagram Reel, YouTube Short, or YouTube watch link after the bot username.",
-                )),
-            )
-            .description("Example: @fetcher_bot https://www.instagram.com/reel/..."),
+        vec![inline_article(
+            "help",
+            "Paste an Instagram Reel or YouTube Short link",
+            "Paste an Instagram Reel or YouTube Short link after the bot username.",
+            "Example: @fetcher_bot https://www.instagram.com/reel/...",
         )]
     };
 
@@ -131,7 +166,105 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery) -> ResponseResult<()> {
     Ok(())
 }
 
-async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
+fn inline_article(
+    id: &str,
+    title: &str,
+    message_text: impl Into<String>,
+    description: &str,
+) -> InlineQueryResult {
+    InlineQueryResult::Article(
+        InlineQueryResultArticle::new(
+            id.to_string(),
+            title,
+            InputMessageContent::Text(InputMessageContentText::new(message_text)),
+        )
+        .description(description),
+    )
+}
+
+async fn prepare_inline_video(
+    bot: &Bot,
+    q: &InlineQuery,
+    link: &DownloadLink<'_>,
+) -> Result<InlineQueryResultCachedVideo, String> {
+    let tmp_path = std::env::temp_dir().join(format!("{}.mp4", Uuid::new_v4()));
+    let title = fetch_title(link.url)
+        .await
+        .unwrap_or_else(|| "video".into());
+
+    log_inline_download_link(link.kind.inline_title(), link.url, q).await;
+
+    let status_msg = bot
+        .send_message(q.from.id, "Preparing inline video...")
+        .await
+        .map_err(|e| format!("Cannot send progress message: {e}"))?;
+    let progress_chat_id = status_msg.chat.id;
+
+    let result = async {
+        download_with_progress(
+            link.url,
+            &tmp_path,
+            &["-f", "mp4"],
+            bot,
+            progress_chat_id,
+            status_msg.id,
+        )
+        .await?;
+
+        let metadata = tokio::fs::metadata(&tmp_path)
+            .await
+            .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
+        if metadata.len() > MAX_TG_SIZE {
+            return Err(format!(
+                "Downloaded video is too large for inline upload ({:.1}MB)",
+                metadata.len() as f64 / 1024.0 / 1024.0
+            ));
+        }
+
+        bot.edit_message_text(progress_chat_id, status_msg.id, "Uploading to Telegram...")
+            .await
+            .ok();
+
+        let file = InputFile::file(&tmp_path).file_name(format!("{title}.mp4"));
+        let uploaded = bot
+            .send_video(q.from.id, file)
+            .await
+            .map_err(|e| format!("Telegram upload error: {e}"))?;
+        let file_id = uploaded
+            .video()
+            .map(|video| video.file.id.clone())
+            .ok_or_else(|| "Telegram response did not contain a video".to_string())?;
+
+        bot.edit_message_text(progress_chat_id, status_msg.id, "Ready in inline results.")
+            .await
+            .ok();
+        bot.delete_message(progress_chat_id, status_msg.id)
+            .await
+            .ok();
+
+        Ok(
+            InlineQueryResultCachedVideo::new("video-file", file_id, title)
+                .description("Send downloaded video")
+                .caption(link.url.to_string()),
+        )
+    }
+    .await;
+
+    if let Err(e) = &result {
+        bot.edit_message_text(
+            progress_chat_id,
+            status_msg.id,
+            format!("Inline video failed: {e}"),
+        )
+        .await
+        .ok();
+    }
+
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+    result
+}
+
+async fn handle_message(bot: Bot, msg: Message, limiter: DownloadLimiter) -> ResponseResult<()> {
     let text = match msg.text() {
         Some(t) => t,
         None => return Ok(()),
@@ -139,6 +272,19 @@ async fn handle_message(bot: Bot, msg: Message) -> ResponseResult<()> {
 
     if let Some(user) = msg.from.as_ref() {
         log::info!("Message from user id: {}", user.id);
+    }
+
+    if find_download_link(text).is_some() {
+        if let Some(user) = msg.from.as_ref() {
+            if let Err(wait_secs) = check_download_limit(&limiter, user.id) {
+                bot.send_message(
+                    msg.chat.id,
+                    format!("Please wait {wait_secs}s before starting another download."),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
     }
 
     let ig_re =
@@ -296,6 +442,31 @@ async fn log_download_link(kind: &str, url: &str, msg: &Message) {
     let line = format!(
         "{ts}\t{kind}\tchat={}\tuser={}\t{url}\n",
         msg.chat.id, user_id
+    );
+
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("download_links.log")
+        .await
+    {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(line.as_bytes()).await {
+                log::warn!("Failed to write download_links.log: {e}");
+            }
+        }
+        Err(e) => log::warn!("Failed to open download_links.log: {e}"),
+    }
+}
+
+async fn log_inline_download_link(kind: &str, url: &str, q: &InlineQuery) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let line = format!(
+        "{ts}\tinline_{kind}\tchat=inline\tuser={}\t{url}\n",
+        q.from.id
     );
 
     match tokio::fs::OpenOptions::new()

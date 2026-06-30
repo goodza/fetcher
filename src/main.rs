@@ -108,7 +108,12 @@ impl DownloadKind {
 
     fn format_args(self) -> &'static [&'static str] {
         match self {
-            Self::XVideo => &["-f", "mp4", "--concat-playlist", "always"],
+            Self::XVideo => &[
+                "-f",
+                "best[ext=mp4][height<=720]/best[height<=720]/mp4",
+                "--concat-playlist",
+                "always",
+            ],
             Self::YouTubeAudio => &["-x", "--audio-format", "mp3"],
             _ => &["-f", "mp4"],
         }
@@ -186,7 +191,12 @@ mod tests {
     fn x_video_download_args_concat_playlist_entries() {
         assert_eq!(
             DownloadKind::XVideo.format_args(),
-            &["-f", "mp4", "--concat-playlist", "always"]
+            &[
+                "-f",
+                "best[ext=mp4][height<=720]/best[height<=720]/mp4",
+                "--concat-playlist",
+                "always"
+            ]
         );
     }
 }

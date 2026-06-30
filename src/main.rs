@@ -108,6 +108,7 @@ impl DownloadKind {
 
     fn format_args(self) -> &'static [&'static str] {
         match self {
+            Self::XVideo => &["-f", "mp4", "--concat-playlist", "always"],
             Self::YouTubeAudio => &["-x", "--audio-format", "mp3"],
             _ => &["-f", "mp4"],
         }
@@ -178,6 +179,14 @@ mod tests {
         assert_eq!(
             link.url,
             "https://x.com/example_user/status/1800000000000000000?s=46&t=test"
+        );
+    }
+
+    #[test]
+    fn x_video_download_args_concat_playlist_entries() {
+        assert_eq!(
+            DownloadKind::XVideo.format_args(),
+            &["-f", "mp4", "--concat-playlist", "always"]
         );
     }
 }
@@ -283,7 +292,7 @@ async fn prepare_inline_video(
         download_with_progress(
             link.url,
             &tmp_path,
-            &["-f", "mp4"],
+            link.kind.format_args(),
             bot,
             progress_chat_id,
             status_msg.id,

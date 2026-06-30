@@ -52,6 +52,7 @@ async fn main() {
 #[derive(Clone, Copy)]
 enum DownloadKind {
     InstagramReel,
+    XVideo,
     YouTubeShort,
     YouTubeAudio,
 }
@@ -60,13 +61,63 @@ impl DownloadKind {
     fn inline_title(self) -> &'static str {
         match self {
             Self::InstagramReel => "Instagram Reel",
+            Self::XVideo => "X video",
             Self::YouTubeShort => "YouTube Short",
             Self::YouTubeAudio => "YouTube audio",
         }
     }
 
     fn is_inline_video(self) -> bool {
-        matches!(self, Self::InstagramReel | Self::YouTubeShort)
+        matches!(
+            self,
+            Self::InstagramReel | Self::XVideo | Self::YouTubeShort
+        )
+    }
+
+    fn log_kind(self) -> &'static str {
+        match self {
+            Self::InstagramReel => "instagram",
+            Self::XVideo => "x",
+            Self::YouTubeShort => "youtube_shorts",
+            Self::YouTubeAudio => "youtube",
+        }
+    }
+
+    fn downloading_message(self) -> &'static str {
+        match self {
+            Self::InstagramReel => "Downloading reel...",
+            Self::XVideo => "Downloading X video...",
+            Self::YouTubeShort => "Downloading short...",
+            Self::YouTubeAudio => "Downloading audio...",
+        }
+    }
+
+    fn title_fallback(self) -> &'static str {
+        match self {
+            Self::YouTubeAudio => "audio",
+            _ => "video",
+        }
+    }
+
+    fn output_extension(self) -> &'static str {
+        match self {
+            Self::YouTubeAudio => "mp3",
+            _ => "mp4",
+        }
+    }
+
+    fn format_args(self) -> &'static [&'static str] {
+        match self {
+            Self::YouTubeAudio => &["-x", "--audio-format", "mp3"],
+            _ => &["-f", "mp4"],
+        }
+    }
+
+    fn sending_message(self) -> &'static str {
+        match self {
+            Self::YouTubeAudio => "Sending audio...",
+            _ => "Sending video...",
+        }
     }
 }
 
@@ -78,6 +129,10 @@ struct DownloadLink<'a> {
 fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
     let ig_re =
         Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_-]+").unwrap();
+    let x_re = Regex::new(
+        r"https?://(?:(?:www\.|mobile\.)?x\.com)/(?:[A-Za-z0-9_]+|i)/status/\d+(?:[/?#][^\s]*)?",
+    )
+    .unwrap();
     let yt_shorts_re =
         Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)").unwrap();
     let yt_re = Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/watch\?[^\s]*v=[A-Za-z0-9_-]+|youtu\.be/[A-Za-z0-9_-]+)")
@@ -86,6 +141,11 @@ fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
     if let Some(m) = ig_re.find(text) {
         Some(DownloadLink {
             kind: DownloadKind::InstagramReel,
+            url: m.as_str(),
+        })
+    } else if let Some(m) = x_re.find(text) {
+        Some(DownloadLink {
+            kind: DownloadKind::XVideo,
             url: m.as_str(),
         })
     } else if let Some(m) = yt_shorts_re.find(text) {
@@ -100,6 +160,25 @@ fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_x_video_status_link() {
+        let link = find_download_link(
+            "watch https://x.com/example_user/status/1800000000000000000?s=46&t=test",
+        )
+        .expect("x.com status link should be detected");
+
+        assert!(matches!(link.kind, DownloadKind::XVideo));
+        assert_eq!(
+            link.url,
+            "https://x.com/example_user/status/1800000000000000000?s=46&t=test"
+        );
     }
 }
 
@@ -153,8 +232,8 @@ async fn handle_inline_query(
     } else {
         vec![inline_article(
             "help",
-            "Paste an Instagram Reel or YouTube Short link",
-            "Paste an Instagram Reel or YouTube Short link after the bot username.",
+            "Paste an Instagram Reel, X video, or YouTube Short link",
+            "Paste an Instagram Reel, X video, or YouTube Short link after the bot username.",
             "Example: @fetcher_bot https://www.instagram.com/reel/...",
         )]
     };
@@ -274,157 +353,81 @@ async fn handle_message(bot: Bot, msg: Message, limiter: DownloadLimiter) -> Res
         log::info!("Message from user id: {}", user.id);
     }
 
-    if find_download_link(text).is_some() {
-        if let Some(user) = msg.from.as_ref() {
-            if let Err(wait_secs) = check_download_limit(&limiter, user.id) {
-                bot.send_message(
+    let Some(link) = find_download_link(text) else {
+        return Ok(());
+    };
+
+    if let Some(user) = msg.from.as_ref() {
+        if let Err(wait_secs) = check_download_limit(&limiter, user.id) {
+            bot.send_message(
+                msg.chat.id,
+                format!("Please wait {wait_secs}s before starting another download."),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    let tmp_path = std::env::temp_dir().join(format!(
+        "{}.{}",
+        Uuid::new_v4(),
+        link.kind.output_extension()
+    ));
+
+    log_download_link(link.kind.log_kind(), link.url, &msg).await;
+
+    let status_msg = bot
+        .send_message(msg.chat.id, link.kind.downloading_message())
+        .await?;
+
+    let title = fetch_title(link.url)
+        .await
+        .unwrap_or_else(|| link.kind.title_fallback().into());
+
+    match download_with_progress(
+        link.url,
+        &tmp_path,
+        link.kind.format_args(),
+        &bot,
+        msg.chat.id,
+        status_msg.id,
+    )
+    .await
+    {
+        Ok(()) => {
+            bot.edit_message_text(msg.chat.id, status_msg.id, link.kind.sending_message())
+                .await
+                .ok();
+
+            let send_result = if link.kind.is_inline_video() {
+                send_video(&bot, msg.chat.id, &tmp_path, &title).await
+            } else {
+                send_audio(&bot, msg.chat.id, &tmp_path, &title).await
+            };
+
+            if let Err(e) = send_result {
+                let media_kind = if link.kind.is_inline_video() {
+                    "video"
+                } else {
+                    "audio"
+                };
+                bot.edit_message_text(
                     msg.chat.id,
-                    format!("Please wait {wait_secs}s before starting another download."),
+                    status_msg.id,
+                    format!("Failed to send {media_kind}: {e}"),
                 )
                 .await?;
-                return Ok(());
+            } else {
+                bot.delete_message(msg.chat.id, status_msg.id).await.ok();
             }
+        }
+        Err(e) => {
+            bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
+                .await?;
         }
     }
 
-    let ig_re =
-        Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_-]+").unwrap();
-    let yt_shorts_re =
-        Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)").unwrap();
-    let yt_re = Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/watch\?[^\s]*v=[A-Za-z0-9_-]+|youtu\.be/[A-Za-z0-9_-]+)")
-        .unwrap();
-
-    if let Some(m) = ig_re.find(text) {
-        let url = m.as_str();
-        let tmp_path = std::env::temp_dir().join(format!("{}.mp4", Uuid::new_v4()));
-
-        log_download_link("instagram", url, &msg).await;
-
-        let status_msg = bot.send_message(msg.chat.id, "Downloading reel...").await?;
-
-        let title = fetch_title(url).await.unwrap_or_else(|| "video".into());
-
-        match download_with_progress(
-            url,
-            &tmp_path,
-            &["-f", "mp4"],
-            &bot,
-            msg.chat.id,
-            status_msg.id,
-        )
-        .await
-        {
-            Ok(()) => {
-                bot.edit_message_text(msg.chat.id, status_msg.id, "Sending video...")
-                    .await
-                    .ok();
-                if let Err(e) = send_video(&bot, msg.chat.id, &tmp_path, &title).await {
-                    bot.edit_message_text(
-                        msg.chat.id,
-                        status_msg.id,
-                        format!("Failed to send video: {e}"),
-                    )
-                    .await?;
-                } else {
-                    bot.delete_message(msg.chat.id, status_msg.id).await.ok();
-                }
-            }
-            Err(e) => {
-                bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
-                    .await?;
-            }
-        }
-
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-    } else if let Some(m) = yt_shorts_re.find(text) {
-        let url = m.as_str();
-        let tmp_path = std::env::temp_dir().join(format!("{}.mp4", Uuid::new_v4()));
-
-        log_download_link("youtube_shorts", url, &msg).await;
-
-        let status_msg = bot
-            .send_message(msg.chat.id, "Downloading short...")
-            .await?;
-
-        let title = fetch_title(url).await.unwrap_or_else(|| "video".into());
-
-        match download_with_progress(
-            url,
-            &tmp_path,
-            &["-f", "mp4"],
-            &bot,
-            msg.chat.id,
-            status_msg.id,
-        )
-        .await
-        {
-            Ok(()) => {
-                bot.edit_message_text(msg.chat.id, status_msg.id, "Sending video...")
-                    .await
-                    .ok();
-                if let Err(e) = send_video(&bot, msg.chat.id, &tmp_path, &title).await {
-                    bot.edit_message_text(
-                        msg.chat.id,
-                        status_msg.id,
-                        format!("Failed to send video: {e}"),
-                    )
-                    .await?;
-                } else {
-                    bot.delete_message(msg.chat.id, status_msg.id).await.ok();
-                }
-            }
-            Err(e) => {
-                bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
-                    .await?;
-            }
-        }
-
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-    } else if let Some(m) = yt_re.find(text) {
-        let url = m.as_str();
-        let tmp_path = std::env::temp_dir().join(format!("{}.mp3", Uuid::new_v4()));
-
-        log_download_link("youtube", url, &msg).await;
-
-        let status_msg = bot
-            .send_message(msg.chat.id, "Downloading audio...")
-            .await?;
-
-        let title = fetch_title(url).await.unwrap_or_else(|| "audio".into());
-
-        match download_with_progress(
-            url,
-            &tmp_path,
-            &["-x", "--audio-format", "mp3"],
-            &bot,
-            msg.chat.id,
-            status_msg.id,
-        )
-        .await
-        {
-            Ok(()) => {
-                bot.edit_message_text(msg.chat.id, status_msg.id, "Sending audio...")
-                    .await
-                    .ok();
-                if let Err(e) = send_audio(&bot, msg.chat.id, &tmp_path, &title).await {
-                    bot.edit_message_text(
-                        msg.chat.id,
-                        status_msg.id,
-                        format!("Failed to send audio: {e}"),
-                    )
-                    .await?;
-                } else {
-                    bot.delete_message(msg.chat.id, status_msg.id).await.ok();
-                }
-            }
-            Err(e) => {
-                bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
-                    .await?;
-            }
-        }
-
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-    }
+    let _ = tokio::fs::remove_file(&tmp_path).await;
 
     Ok(())
 }

@@ -9,8 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineQueryResult, InlineQueryResultArticle, InlineQueryResultCachedVideo, InputFile,
-    InputMessageContent, InputMessageContentText, MessageId, UserId,
+    InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle,
+    InlineQueryResultCachedVideo, InputFile, InputMessageContent, InputMessageContentText,
+    MessageId, UserId,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
@@ -18,6 +19,7 @@ use uuid::Uuid;
 
 const DOWNLOAD_COOLDOWN: Duration = Duration::from_secs(60);
 type DownloadLimiter = Arc<Mutex<HashMap<UserId, Instant>>>;
+type DownloadStore = Arc<Mutex<HashMap<String, String>>>;
 
 #[tokio::main]
 async fn main() {
@@ -37,12 +39,14 @@ async fn main() {
         .expect("Failed to build HTTP client");
     let bot = Bot::with_client(token, client);
     let limiter: DownloadLimiter = Arc::new(Mutex::new(HashMap::new()));
+    let downloads: DownloadStore = Arc::new(Mutex::new(HashMap::new()));
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handle_message))
-        .branch(Update::filter_inline_query().endpoint(handle_inline_query));
+        .branch(Update::filter_inline_query().endpoint(handle_inline_query))
+        .branch(Update::filter_callback_query().endpoint(handle_callback_query));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![limiter])
+        .dependencies(dptree::deps![limiter, downloads])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -54,6 +58,7 @@ enum DownloadKind {
     InstagramReel,
     XVideo,
     YouTubeShort,
+    YouTubeVideo,
     YouTubeAudio,
 }
 
@@ -63,6 +68,7 @@ impl DownloadKind {
             Self::InstagramReel => "Instagram Reel",
             Self::XVideo => "X video",
             Self::YouTubeShort => "YouTube Short",
+            Self::YouTubeVideo => "YouTube video",
             Self::YouTubeAudio => "YouTube audio",
         }
     }
@@ -70,7 +76,14 @@ impl DownloadKind {
     fn is_inline_video(self) -> bool {
         matches!(
             self,
-            Self::InstagramReel | Self::XVideo | Self::YouTubeShort
+            Self::InstagramReel | Self::XVideo | Self::YouTubeShort | Self::YouTubeVideo
+        )
+    }
+
+    fn is_youtube(self) -> bool {
+        matches!(
+            self,
+            Self::YouTubeShort | Self::YouTubeVideo | Self::YouTubeAudio
         )
     }
 
@@ -79,6 +92,7 @@ impl DownloadKind {
             Self::InstagramReel => "instagram",
             Self::XVideo => "x",
             Self::YouTubeShort => "youtube_shorts",
+            Self::YouTubeVideo => "youtube_video",
             Self::YouTubeAudio => "youtube",
         }
     }
@@ -87,7 +101,7 @@ impl DownloadKind {
         match self {
             Self::InstagramReel => "Downloading reel...",
             Self::XVideo => "Downloading X video...",
-            Self::YouTubeShort => "Downloading short...",
+            Self::YouTubeShort | Self::YouTubeVideo => "Downloading video...",
             Self::YouTubeAudio => "Downloading audio...",
         }
     }
@@ -161,12 +175,21 @@ fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
         })
     } else if let Some(m) = yt_re.find(text) {
         Some(DownloadLink {
-            kind: DownloadKind::YouTubeAudio,
+            kind: DownloadKind::YouTubeVideo,
             url: m.as_str(),
         })
     } else {
         None
     }
+}
+
+fn parse_youtube_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
+    data.strip_prefix("ytv:")
+        .map(|id| (DownloadKind::YouTubeVideo, id))
+        .or_else(|| {
+            data.strip_prefix("yta:")
+                .map(|id| (DownloadKind::YouTubeAudio, id))
+        })
 }
 
 #[cfg(test)]
@@ -198,6 +221,27 @@ mod tests {
                 "always"
             ]
         );
+    }
+
+    #[test]
+    fn youtube_watch_link_defaults_to_video_menu() {
+        let link = find_download_link("watch https://www.youtube.com/watch?v=Sv5ZZB-M59Q")
+            .expect("youtube watch link should be detected");
+
+        assert!(matches!(link.kind, DownloadKind::YouTubeVideo));
+        assert!(link.kind.is_youtube());
+    }
+
+    #[test]
+    fn parses_youtube_download_callback_choice() {
+        let (kind, id) = parse_youtube_download_callback("yta:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeAudio));
+        assert_eq!(id, "abc123");
+
+        let (kind, id) = parse_youtube_download_callback("ytv:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeVideo));
+        assert_eq!(id, "abc123");
+        assert!(parse_youtube_download_callback("ig:abc123").is_none());
     }
 }
 
@@ -362,7 +406,148 @@ async fn prepare_inline_video(
     result
 }
 
-async fn handle_message(bot: Bot, msg: Message, limiter: DownloadLimiter) -> ResponseResult<()> {
+async fn send_youtube_menu(
+    bot: &Bot,
+    chat_id: ChatId,
+    url: &str,
+    downloads: &DownloadStore,
+) -> ResponseResult<()> {
+    let id = Uuid::new_v4().to_string();
+    {
+        let mut downloads = downloads.lock().expect("download store lock poisoned");
+        downloads.insert(id.clone(), url.to_string());
+    }
+
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("Video", format!("ytv:{id}")),
+        InlineKeyboardButton::callback("Audio", format!("yta:{id}")),
+    ]]);
+
+    bot.send_message(chat_id, "Choose download type:")
+        .reply_markup(keyboard)
+        .await?;
+
+    Ok(())
+}
+
+async fn download_and_send_media(
+    bot: &Bot,
+    chat_id: ChatId,
+    status_msg_id: MessageId,
+    kind: DownloadKind,
+    url: &str,
+) -> Result<(), String> {
+    let tmp_path =
+        std::env::temp_dir().join(format!("{}.{}", Uuid::new_v4(), kind.output_extension()));
+
+    let result = async {
+        let title = fetch_title(url)
+            .await
+            .unwrap_or_else(|| kind.title_fallback().into());
+
+        download_with_progress(
+            url,
+            &tmp_path,
+            kind.format_args(),
+            bot,
+            chat_id,
+            status_msg_id,
+        )
+        .await?;
+
+        bot.edit_message_text(chat_id, status_msg_id, kind.sending_message())
+            .await
+            .ok();
+
+        if kind.is_inline_video() {
+            send_video(bot, chat_id, &tmp_path, &title).await
+        } else {
+            send_audio(bot, chat_id, &tmp_path, &title).await
+        }
+    }
+    .await;
+
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+
+    if result.is_ok() {
+        bot.delete_message(chat_id, status_msg_id).await.ok();
+    }
+
+    result
+}
+
+async fn handle_callback_query(
+    bot: Bot,
+    q: CallbackQuery,
+    limiter: DownloadLimiter,
+    downloads: DownloadStore,
+) -> ResponseResult<()> {
+    let Some(data) = q.data.as_deref() else {
+        return Ok(());
+    };
+    let Some((kind, id)) = parse_youtube_download_callback(data) else {
+        return Ok(());
+    };
+
+    let Some(message) = q.regular_message() else {
+        bot.answer_callback_query(q.id)
+            .text("Cannot access this menu message. Send the YouTube link again.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    };
+    let chat_id = message.chat.id;
+    let status_msg_id = message.id;
+
+    let url = {
+        let downloads = downloads.lock().expect("download store lock poisoned");
+        downloads.get(id).cloned()
+    };
+    let Some(url) = url else {
+        bot.answer_callback_query(q.id)
+            .text("This download menu expired. Send the YouTube link again.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    };
+
+    if let Err(wait_secs) = check_download_limit(&limiter, q.from.id) {
+        bot.answer_callback_query(q.id)
+            .text(format!(
+                "Please wait {wait_secs}s before starting another download."
+            ))
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+
+    {
+        let mut downloads = downloads.lock().expect("download store lock poisoned");
+        downloads.remove(id);
+    }
+
+    bot.answer_callback_query(q.id.clone()).await?;
+
+    log_callback_download_link(kind.log_kind(), &url, &q).await;
+
+    bot.edit_message_text(chat_id, status_msg_id, kind.downloading_message())
+        .await
+        .ok();
+
+    if let Err(e) = download_and_send_media(&bot, chat_id, status_msg_id, kind, &url).await {
+        bot.edit_message_text(chat_id, status_msg_id, format!("Download failed: {e}"))
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_message(
+    bot: Bot,
+    msg: Message,
+    limiter: DownloadLimiter,
+    downloads: DownloadStore,
+) -> ResponseResult<()> {
     let text = match msg.text() {
         Some(t) => t,
         None => return Ok(()),
@@ -376,6 +561,11 @@ async fn handle_message(bot: Bot, msg: Message, limiter: DownloadLimiter) -> Res
         return Ok(());
     };
 
+    if link.kind.is_youtube() {
+        send_youtube_menu(&bot, msg.chat.id, link.url, &downloads).await?;
+        return Ok(());
+    }
+
     if let Some(user) = msg.from.as_ref() {
         if let Err(wait_secs) = check_download_limit(&limiter, user.id) {
             bot.send_message(
@@ -387,66 +577,18 @@ async fn handle_message(bot: Bot, msg: Message, limiter: DownloadLimiter) -> Res
         }
     }
 
-    let tmp_path = std::env::temp_dir().join(format!(
-        "{}.{}",
-        Uuid::new_v4(),
-        link.kind.output_extension()
-    ));
-
     log_download_link(link.kind.log_kind(), link.url, &msg).await;
 
     let status_msg = bot
         .send_message(msg.chat.id, link.kind.downloading_message())
         .await?;
 
-    let title = fetch_title(link.url)
-        .await
-        .unwrap_or_else(|| link.kind.title_fallback().into());
-
-    match download_with_progress(
-        link.url,
-        &tmp_path,
-        link.kind.format_args(),
-        &bot,
-        msg.chat.id,
-        status_msg.id,
-    )
-    .await
+    if let Err(e) =
+        download_and_send_media(&bot, msg.chat.id, status_msg.id, link.kind, link.url).await
     {
-        Ok(()) => {
-            bot.edit_message_text(msg.chat.id, status_msg.id, link.kind.sending_message())
-                .await
-                .ok();
-
-            let send_result = if link.kind.is_inline_video() {
-                send_video(&bot, msg.chat.id, &tmp_path, &title).await
-            } else {
-                send_audio(&bot, msg.chat.id, &tmp_path, &title).await
-            };
-
-            if let Err(e) = send_result {
-                let media_kind = if link.kind.is_inline_video() {
-                    "video"
-                } else {
-                    "audio"
-                };
-                bot.edit_message_text(
-                    msg.chat.id,
-                    status_msg.id,
-                    format!("Failed to send {media_kind}: {e}"),
-                )
-                .await?;
-            } else {
-                bot.delete_message(msg.chat.id, status_msg.id).await.ok();
-            }
-        }
-        Err(e) => {
-            bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
-                .await?;
-        }
+        bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
+            .await?;
     }
-
-    let _ = tokio::fs::remove_file(&tmp_path).await;
 
     Ok(())
 }
@@ -488,6 +630,35 @@ async fn log_inline_download_link(kind: &str, url: &str, q: &InlineQuery) {
         .unwrap_or_default();
     let line = format!(
         "{ts}\tinline_{kind}\tchat=inline\tuser={}\t{url}\n",
+        q.from.id
+    );
+
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("download_links.log")
+        .await
+    {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(line.as_bytes()).await {
+                log::warn!("Failed to write download_links.log: {e}");
+            }
+        }
+        Err(e) => log::warn!("Failed to open download_links.log: {e}"),
+    }
+}
+
+async fn log_callback_download_link(kind: &str, url: &str, q: &CallbackQuery) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let chat_id = q
+        .regular_message()
+        .map(|message| message.chat.id.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let line = format!(
+        "{ts}\tcallback_{kind}\tchat={chat_id}\tuser={}\t{url}\n",
         q.from.id
     );
 

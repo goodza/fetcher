@@ -603,10 +603,7 @@ async fn log_download_link(kind: &str, url: &str, msg: &Message) {
         .as_ref()
         .map(|user| user.id.0.to_string())
         .unwrap_or_else(|| "unknown".into());
-    let line = format!(
-        "{ts}\t{kind}\tchat={}\tuser={}\t{url}\n",
-        msg.chat.id, user_id
-    );
+    let line = format!("{ts}\t{kind}\tuser={user_id}\t{url}\n");
 
     match tokio::fs::OpenOptions::new()
         .create(true)
@@ -628,10 +625,7 @@ async fn log_inline_download_link(kind: &str, url: &str, q: &InlineQuery) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let line = format!(
-        "{ts}\tinline_{kind}\tchat=inline\tuser={}\t{url}\n",
-        q.from.id
-    );
+    let line = format!("{ts}\tinline_{kind}\tuser={}\t{url}\n", q.from.id);
 
     match tokio::fs::OpenOptions::new()
         .create(true)
@@ -653,14 +647,7 @@ async fn log_callback_download_link(kind: &str, url: &str, q: &CallbackQuery) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let chat_id = q
-        .regular_message()
-        .map(|message| message.chat.id.to_string())
-        .unwrap_or_else(|| "unknown".into());
-    let line = format!(
-        "{ts}\tcallback_{kind}\tchat={chat_id}\tuser={}\t{url}\n",
-        q.from.id
-    );
+    let line = format!("{ts}\tcallback_{kind}\tuser={}\t{url}\n", q.from.id);
 
     match tokio::fs::OpenOptions::new()
         .create(true)

@@ -128,6 +128,12 @@ impl DownloadKind {
                 "--concat-playlist",
                 "always",
             ],
+            Self::YouTubeVideo => &[
+                "-f",
+                "bestvideo[height<=1024][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1024]+bestaudio/best[height<=1024][ext=mp4]/best[height<=1024]/best",
+                "--merge-output-format",
+                "mp4",
+            ],
             Self::YouTubeAudio => &["-x", "--audio-format", "mp3"],
             _ => &["-f", "mp4"],
         }
@@ -219,6 +225,19 @@ mod tests {
                 "best[ext=mp4][height<=720]/best[height<=720]/mp4",
                 "--concat-playlist",
                 "always"
+            ]
+        );
+    }
+
+    #[test]
+    fn youtube_video_download_args_prefer_1024p_or_best_available() {
+        assert_eq!(
+            DownloadKind::YouTubeVideo.format_args(),
+            &[
+                "-f",
+                "bestvideo[height<=1024][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1024]+bestaudio/best[height<=1024][ext=mp4]/best[height<=1024]/best",
+                "--merge-output-format",
+                "mp4"
             ]
         );
     }
@@ -460,7 +479,7 @@ async fn download_and_send_media(
             .ok();
 
         if kind.is_inline_video() {
-            send_video(bot, chat_id, &tmp_path, &title).await
+            send_video(bot, chat_id, &tmp_path, &title, kind).await
         } else {
             send_audio(bot, chat_id, &tmp_path, &title).await
         }
@@ -912,7 +931,13 @@ async fn send_audio(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Res
     Ok(())
 }
 
-async fn send_video(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Result<(), String> {
+async fn send_video(
+    bot: &Bot,
+    chat_id: ChatId,
+    path: &Path,
+    title: &str,
+    kind: DownloadKind,
+) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
@@ -922,6 +947,18 @@ async fn send_video(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Res
         bot.send_video(chat_id, file)
             .await
             .map_err(|e| format!("Telegram API error: {e}"))?;
+        return Ok(());
+    }
+
+    if matches!(kind, DownloadKind::YouTubeVideo) {
+        log::info!(
+            "Sending oversized YouTube video as document ({:.1}MB)",
+            metadata.len() as f64 / 1024.0 / 1024.0
+        );
+        let file = InputFile::file(path).file_name(format!("{title}.mp4"));
+        bot.send_document(chat_id, file)
+            .await
+            .map_err(|e| format!("Telegram API error sending file: {e}"))?;
         return Ok(());
     }
 

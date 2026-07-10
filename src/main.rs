@@ -59,6 +59,12 @@ enum DownloadKind {
     XVideo,
     YouTubeShort,
     YouTubeVideo,
+    YouTubeVideo360,
+    YouTubeVideo480,
+    YouTubeVideo720,
+    YouTubeVideo1024,
+    YouTubeVideo1440,
+    YouTubeVideo2160,
     YouTubeAudio,
 }
 
@@ -67,8 +73,14 @@ impl DownloadKind {
         match self {
             Self::InstagramReel => "Instagram Reel",
             Self::XVideo => "X video",
-            Self::YouTubeShort => "YouTube Short",
-            Self::YouTubeVideo => "YouTube video",
+            Self::YouTubeShort
+            | Self::YouTubeVideo
+            | Self::YouTubeVideo360
+            | Self::YouTubeVideo480
+            | Self::YouTubeVideo720
+            | Self::YouTubeVideo1024
+            | Self::YouTubeVideo1440
+            | Self::YouTubeVideo2160 => "YouTube video",
             Self::YouTubeAudio => "YouTube audio",
         }
     }
@@ -76,14 +88,44 @@ impl DownloadKind {
     fn is_inline_video(self) -> bool {
         matches!(
             self,
-            Self::InstagramReel | Self::XVideo | Self::YouTubeShort | Self::YouTubeVideo
+            Self::InstagramReel
+                | Self::XVideo
+                | Self::YouTubeShort
+                | Self::YouTubeVideo
+                | Self::YouTubeVideo360
+                | Self::YouTubeVideo480
+                | Self::YouTubeVideo720
+                | Self::YouTubeVideo1024
+                | Self::YouTubeVideo1440
+                | Self::YouTubeVideo2160
         )
     }
 
     fn is_youtube(self) -> bool {
         matches!(
             self,
-            Self::YouTubeShort | Self::YouTubeVideo | Self::YouTubeAudio
+            Self::YouTubeShort
+                | Self::YouTubeVideo
+                | Self::YouTubeVideo360
+                | Self::YouTubeVideo480
+                | Self::YouTubeVideo720
+                | Self::YouTubeVideo1024
+                | Self::YouTubeVideo1440
+                | Self::YouTubeVideo2160
+                | Self::YouTubeAudio
+        )
+    }
+
+    fn is_youtube_video(self) -> bool {
+        matches!(
+            self,
+            Self::YouTubeVideo
+                | Self::YouTubeVideo360
+                | Self::YouTubeVideo480
+                | Self::YouTubeVideo720
+                | Self::YouTubeVideo1024
+                | Self::YouTubeVideo1440
+                | Self::YouTubeVideo2160
         )
     }
 
@@ -93,6 +135,12 @@ impl DownloadKind {
             Self::XVideo => "x",
             Self::YouTubeShort => "youtube_shorts",
             Self::YouTubeVideo => "youtube_video",
+            Self::YouTubeVideo360 => "youtube_video_360",
+            Self::YouTubeVideo480 => "youtube_video_480",
+            Self::YouTubeVideo720 => "youtube_video_720",
+            Self::YouTubeVideo1024 => "youtube_video_1024",
+            Self::YouTubeVideo1440 => "youtube_video_1440",
+            Self::YouTubeVideo2160 => "youtube_video_2160",
             Self::YouTubeAudio => "youtube",
         }
     }
@@ -101,7 +149,14 @@ impl DownloadKind {
         match self {
             Self::InstagramReel => "Downloading reel...",
             Self::XVideo => "Downloading X video...",
-            Self::YouTubeShort | Self::YouTubeVideo => "Downloading video...",
+            Self::YouTubeShort
+            | Self::YouTubeVideo
+            | Self::YouTubeVideo360
+            | Self::YouTubeVideo480
+            | Self::YouTubeVideo720
+            | Self::YouTubeVideo1024
+            | Self::YouTubeVideo1440
+            | Self::YouTubeVideo2160 => "Downloading video...",
             Self::YouTubeAudio => "Downloading audio...",
         }
     }
@@ -128,9 +183,39 @@ impl DownloadKind {
                 "--concat-playlist",
                 "always",
             ],
-            Self::YouTubeVideo => &[
+            Self::YouTubeVideo | Self::YouTubeVideo1024 => &[
                 "-f",
                 "bestvideo[height<=1024][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1024]+bestaudio/best[height<=1024][ext=mp4]/best[height<=1024]/best",
+                "--merge-output-format",
+                "mp4",
+            ],
+            Self::YouTubeVideo720 => &[
+                "-f",
+                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720][ext=mp4]/best[height<=720]/best",
+                "--merge-output-format",
+                "mp4",
+            ],
+            Self::YouTubeVideo480 => &[
+                "-f",
+                "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480][ext=mp4]/best[height<=480]/best",
+                "--merge-output-format",
+                "mp4",
+            ],
+            Self::YouTubeVideo360 => &[
+                "-f",
+                "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360][ext=mp4]/best[height<=360]/best",
+                "--merge-output-format",
+                "mp4",
+            ],
+            Self::YouTubeVideo1440 => &[
+                "-f",
+                "bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best[height<=1440][ext=mp4]/best[height<=1440]/best",
+                "--merge-output-format",
+                "mp4",
+            ],
+            Self::YouTubeVideo2160 => &[
+                "-f",
+                "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160][ext=mp4]/best[height<=2160]/best",
                 "--merge-output-format",
                 "mp4",
             ],
@@ -190,8 +275,32 @@ fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
 }
 
 fn parse_youtube_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
-    data.strip_prefix("ytv:")
-        .map(|id| (DownloadKind::YouTubeVideo, id))
+    data.strip_prefix("ytv360:")
+        .map(|id| (DownloadKind::YouTubeVideo360, id))
+        .or_else(|| {
+            data.strip_prefix("ytv480:")
+                .map(|id| (DownloadKind::YouTubeVideo480, id))
+        })
+        .or_else(|| {
+            data.strip_prefix("ytv720:")
+                .map(|id| (DownloadKind::YouTubeVideo720, id))
+        })
+        .or_else(|| {
+            data.strip_prefix("ytv1024:")
+                .map(|id| (DownloadKind::YouTubeVideo1024, id))
+        })
+        .or_else(|| {
+            data.strip_prefix("ytv1440:")
+                .map(|id| (DownloadKind::YouTubeVideo1440, id))
+        })
+        .or_else(|| {
+            data.strip_prefix("ytv2160:")
+                .map(|id| (DownloadKind::YouTubeVideo2160, id))
+        })
+        .or_else(|| {
+            data.strip_prefix("ytv:")
+                .map(|id| (DownloadKind::YouTubeVideo1024, id))
+        })
         .or_else(|| {
             data.strip_prefix("yta:")
                 .map(|id| (DownloadKind::YouTubeAudio, id))
@@ -243,6 +352,19 @@ mod tests {
     }
 
     #[test]
+    fn youtube_quality_download_args_use_selected_height() {
+        assert!(DownloadKind::YouTubeVideo360.format_args()[1].contains("height<=360"));
+        assert!(DownloadKind::YouTubeVideo480.format_args()[1].contains("height<=480"));
+        assert!(DownloadKind::YouTubeVideo720.format_args()[1].contains("height<=720"));
+        assert_eq!(
+            DownloadKind::YouTubeVideo1024.format_args(),
+            DownloadKind::YouTubeVideo.format_args()
+        );
+        assert!(DownloadKind::YouTubeVideo1440.format_args()[1].contains("height<=1440"));
+        assert!(DownloadKind::YouTubeVideo2160.format_args()[1].contains("height<=2160"));
+    }
+
+    #[test]
     fn youtube_watch_link_defaults_to_video_menu() {
         let link = find_download_link("watch https://www.youtube.com/watch?v=Sv5ZZB-M59Q")
             .expect("youtube watch link should be detected");
@@ -257,8 +379,20 @@ mod tests {
         assert!(matches!(kind, DownloadKind::YouTubeAudio));
         assert_eq!(id, "abc123");
 
+        let (kind, id) = parse_youtube_download_callback("ytv720:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeVideo720));
+        assert_eq!(id, "abc123");
+
+        let (kind, id) = parse_youtube_download_callback("ytv1440:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeVideo1440));
+        assert_eq!(id, "abc123");
+
+        let (kind, id) = parse_youtube_download_callback("ytv2160:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeVideo2160));
+        assert_eq!(id, "abc123");
+
         let (kind, id) = parse_youtube_download_callback("ytv:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeVideo));
+        assert!(matches!(kind, DownloadKind::YouTubeVideo1024));
         assert_eq!(id, "abc123");
         assert!(parse_youtube_download_callback("ig:abc123").is_none());
     }
@@ -437,12 +571,23 @@ async fn send_youtube_menu(
         downloads.insert(id.clone(), url.to_string());
     }
 
-    let keyboard = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("Video", format!("ytv:{id}")),
-        InlineKeyboardButton::callback("Audio", format!("yta:{id}")),
-    ]]);
+    let keyboard = InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("360p", format!("ytv360:{id}")),
+            InlineKeyboardButton::callback("480p", format!("ytv480:{id}")),
+        ],
+        vec![
+            InlineKeyboardButton::callback("720p", format!("ytv720:{id}")),
+            InlineKeyboardButton::callback("1024p", format!("ytv1024:{id}")),
+        ],
+        vec![
+            InlineKeyboardButton::callback("2K", format!("ytv1440:{id}")),
+            InlineKeyboardButton::callback("4K", format!("ytv2160:{id}")),
+        ],
+        vec![InlineKeyboardButton::callback("Audio", format!("yta:{id}"))],
+    ]);
 
-    bot.send_message(chat_id, "Choose download type:")
+    bot.send_message(chat_id, "Choose quality or audio:")
         .reply_markup(keyboard)
         .await?;
 
@@ -950,7 +1095,7 @@ async fn send_video(
         return Ok(());
     }
 
-    if matches!(kind, DownloadKind::YouTubeVideo) {
+    if kind.is_youtube_video() {
         log::info!(
             "Sending oversized YouTube video as document ({:.1}MB)",
             metadata.len() as f64 / 1024.0 / 1024.0

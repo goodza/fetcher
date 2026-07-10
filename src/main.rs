@@ -207,6 +207,14 @@ impl DownloadKind {
         }
     }
 
+    fn metadata_args(self) -> &'static [&'static str] {
+        if self.is_youtube() {
+            &["--embed-metadata", "--parse-metadata", "channel:artist"]
+        } else {
+            &[]
+        }
+    }
+
     fn sending_message(self) -> &'static str {
         match self {
             Self::YouTubeAudio => "Sending audio...",
@@ -434,6 +442,7 @@ async fn download_and_send_media(
             url,
             &tmp_path,
             kind.format_args(),
+            kind.metadata_args(),
             bot,
             chat_id,
             status_msg_id,
@@ -719,12 +728,13 @@ async fn download_with_progress(
     url: &str,
     output: &Path,
     format_args: &[&str],
+    metadata_args: &[&str],
     bot: &Bot,
     chat_id: ChatId,
     msg_id: MessageId,
 ) -> Result<(), String> {
     let mut cmd = tokio::process::Command::new("yt-dlp");
-    cmd.args(format_args).args([
+    cmd.args(format_args).args(metadata_args).args([
         "--newline",
         "--js-runtimes",
         "node",
@@ -1071,6 +1081,20 @@ mod tests {
                 "mp4"
             ]
         );
+    }
+
+    #[test]
+    fn youtube_download_args_embed_channel_as_artist_metadata() {
+        assert_eq!(
+            DownloadKind::YouTubeVideo.metadata_args(),
+            &["--embed-metadata", "--parse-metadata", "channel:artist"]
+        );
+        assert_eq!(
+            DownloadKind::YouTubeAudio.metadata_args(),
+            &["--embed-metadata", "--parse-metadata", "channel:artist"]
+        );
+        assert!(DownloadKind::InstagramReel.metadata_args().is_empty());
+        assert!(DownloadKind::XVideo.metadata_args().is_empty());
     }
 
     #[test]

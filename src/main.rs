@@ -158,6 +158,13 @@ impl DownloadKind {
         }
     }
 
+    fn caption_field(self) -> Option<&'static str> {
+        match self {
+            Self::YouTubeAudio => Some("channel"),
+            _ => None,
+        }
+    }
+
     fn format_args(self) -> &'static [&'static str] {
         match self {
             Self::XVideo => &[
@@ -434,9 +441,14 @@ async fn download_and_send_media(
         std::env::temp_dir().join(format!("{}.{}", Uuid::new_v4(), kind.output_extension()));
 
     let result = async {
-        let title = fetch_title(url)
+        let title = fetch_metadata_field(url, "title")
             .await
             .unwrap_or_else(|| kind.title_fallback().into());
+        let channel = if let Some(field) = kind.caption_field() {
+            fetch_metadata_field(url, field).await
+        } else {
+            None
+        };
 
         download_with_progress(
             url,
@@ -456,7 +468,7 @@ async fn download_and_send_media(
         if kind.is_inline_video() {
             send_video(bot, chat_id, &tmp_path, &title, kind).await
         } else {
-            send_audio(bot, chat_id, &tmp_path, &title).await
+            send_audio(bot, chat_id, &tmp_path, &title, channel.as_deref()).await
         }
     }
     .await;
@@ -820,11 +832,11 @@ async fn download_with_progress(
     Ok(())
 }
 
-async fn fetch_title(url: &str) -> Option<String> {
+async fn fetch_metadata_field(url: &str, field: &str) -> Option<String> {
     let mut cmd = tokio::process::Command::new("yt-dlp");
     cmd.args([
         "--print",
-        "title",
+        field,
         "--no-download",
         "--js-runtimes",
         "node",
@@ -844,14 +856,24 @@ async fn fetch_title(url: &str) -> Option<String> {
 
 const MAX_TG_SIZE: u64 = 49 * 1024 * 1024;
 
-async fn send_audio(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Result<(), String> {
+async fn send_audio(
+    bot: &Bot,
+    chat_id: ChatId,
+    path: &Path,
+    title: &str,
+    channel: Option<&str>,
+) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
     if metadata.len() <= MAX_TG_SIZE {
         let file = InputFile::file(path).file_name(format!("{title}.mp3"));
-        bot.send_audio(chat_id, file)
+        let mut request = bot.send_audio(chat_id, file).title(title);
+        if let Some(channel) = channel {
+            request = request.performer(channel).caption(channel);
+        }
+        request
             .await
             .map_err(|e| format!("Telegram API error: {e}"))?;
         return Ok(());
@@ -866,7 +888,11 @@ async fn send_audio(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Res
             title.to_string()
         };
         let file = InputFile::file(chunk).file_name(format!("{label}.mp3"));
-        bot.send_audio(chat_id, file)
+        let mut request = bot.send_audio(chat_id, file).title(label);
+        if let Some(channel) = channel {
+            request = request.performer(channel).caption(channel);
+        }
+        request
             .await
             .map_err(|e| format!("Telegram API error on chunk {}: {e}", i + 1))?;
     }
@@ -1095,6 +1121,13 @@ mod tests {
         );
         assert!(DownloadKind::InstagramReel.metadata_args().is_empty());
         assert!(DownloadKind::XVideo.metadata_args().is_empty());
+    }
+
+    #[test]
+    fn youtube_audio_uses_channel_as_audio_caption() {
+        assert_eq!(DownloadKind::YouTubeAudio.caption_field(), Some("channel"));
+        assert_eq!(DownloadKind::YouTubeVideo.caption_field(), None);
+        assert_eq!(DownloadKind::InstagramReel.caption_field(), None);
     }
 
     #[test]

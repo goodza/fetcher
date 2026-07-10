@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, LazyLock, Mutex,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,8 +10,7 @@ use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle,
-    InlineQueryResultCachedVideo, InputFile, InputMessageContent, InputMessageContentText,
-    MessageId, UserId,
+    InputFile, InputMessageContent, InputMessageContentText, MessageId, UserId,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
@@ -69,22 +68,6 @@ enum DownloadKind {
 }
 
 impl DownloadKind {
-    fn inline_title(self) -> &'static str {
-        match self {
-            Self::InstagramReel => "Instagram Reel",
-            Self::XVideo => "X video",
-            Self::YouTubeShort
-            | Self::YouTubeVideo
-            | Self::YouTubeVideo360
-            | Self::YouTubeVideo480
-            | Self::YouTubeVideo720
-            | Self::YouTubeVideo1024
-            | Self::YouTubeVideo1440
-            | Self::YouTubeVideo2160 => "YouTube video",
-            Self::YouTubeAudio => "YouTube audio",
-        }
-    }
-
     fn is_inline_video(self) -> bool {
         matches!(
             self,
@@ -237,40 +220,44 @@ struct DownloadLink<'a> {
     url: &'a str,
 }
 
-fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
-    let ig_re =
-        Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_-]+").unwrap();
-    let x_re = Regex::new(
+static IG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_-]+").unwrap()
+});
+static X_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
         r"https?://(?:(?:www\.|mobile\.)?x\.com)/(?:[A-Za-z0-9_]+|i)/status/\d+(?:[/?#][^\s]*)?",
     )
-    .unwrap();
-    let yt_shorts_re =
-        Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)").unwrap();
-    let yt_re = Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/watch\?[^\s]*v=[A-Za-z0-9_-]+|youtu\.be/[A-Za-z0-9_-]+)")
-        .unwrap();
+    .unwrap()
+});
+static YT_SHORTS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)").unwrap()
+});
+static YT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/watch\?[^\s]*v=[A-Za-z0-9_-]+|youtu\.be/[A-Za-z0-9_-]+)")
+        .unwrap()
+});
 
-    if let Some(m) = ig_re.find(text) {
+fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
+    if let Some(m) = IG_RE.find(text) {
         Some(DownloadLink {
             kind: DownloadKind::InstagramReel,
             url: m.as_str(),
         })
-    } else if let Some(m) = x_re.find(text) {
+    } else if let Some(m) = X_RE.find(text) {
         Some(DownloadLink {
             kind: DownloadKind::XVideo,
             url: m.as_str(),
         })
-    } else if let Some(m) = yt_shorts_re.find(text) {
+    } else if let Some(m) = YT_SHORTS_RE.find(text) {
         Some(DownloadLink {
             kind: DownloadKind::YouTubeShort,
             url: m.as_str(),
         })
-    } else if let Some(m) = yt_re.find(text) {
-        Some(DownloadLink {
+    } else {
+        YT_RE.find(text).map(|m| DownloadLink {
             kind: DownloadKind::YouTubeVideo,
             url: m.as_str(),
         })
-    } else {
-        None
     }
 }
 
@@ -307,98 +294,7 @@ fn parse_youtube_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
         })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finds_x_video_status_link() {
-        let link = find_download_link(
-            "watch https://x.com/example_user/status/1800000000000000000?s=46&t=test",
-        )
-        .expect("x.com status link should be detected");
-
-        assert!(matches!(link.kind, DownloadKind::XVideo));
-        assert_eq!(
-            link.url,
-            "https://x.com/example_user/status/1800000000000000000?s=46&t=test"
-        );
-    }
-
-    #[test]
-    fn x_video_download_args_concat_playlist_entries() {
-        assert_eq!(
-            DownloadKind::XVideo.format_args(),
-            &[
-                "-f",
-                "best[ext=mp4][height<=720]/best[height<=720]/mp4",
-                "--concat-playlist",
-                "always"
-            ]
-        );
-    }
-
-    #[test]
-    fn youtube_video_download_args_prefer_1024p_or_best_available() {
-        assert_eq!(
-            DownloadKind::YouTubeVideo.format_args(),
-            &[
-                "-f",
-                "bestvideo[height<=1024][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1024]+bestaudio/best[height<=1024][ext=mp4]/best[height<=1024]/best",
-                "--merge-output-format",
-                "mp4"
-            ]
-        );
-    }
-
-    #[test]
-    fn youtube_quality_download_args_use_selected_height() {
-        assert!(DownloadKind::YouTubeVideo360.format_args()[1].contains("height<=360"));
-        assert!(DownloadKind::YouTubeVideo480.format_args()[1].contains("height<=480"));
-        assert!(DownloadKind::YouTubeVideo720.format_args()[1].contains("height<=720"));
-        assert_eq!(
-            DownloadKind::YouTubeVideo1024.format_args(),
-            DownloadKind::YouTubeVideo.format_args()
-        );
-        assert!(DownloadKind::YouTubeVideo1440.format_args()[1].contains("height<=1440"));
-        assert!(DownloadKind::YouTubeVideo2160.format_args()[1].contains("height<=2160"));
-    }
-
-    #[test]
-    fn youtube_watch_link_defaults_to_video_menu() {
-        let link = find_download_link("watch https://www.youtube.com/watch?v=Sv5ZZB-M59Q")
-            .expect("youtube watch link should be detected");
-
-        assert!(matches!(link.kind, DownloadKind::YouTubeVideo));
-        assert!(link.kind.is_youtube());
-    }
-
-    #[test]
-    fn parses_youtube_download_callback_choice() {
-        let (kind, id) = parse_youtube_download_callback("yta:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeAudio));
-        assert_eq!(id, "abc123");
-
-        let (kind, id) = parse_youtube_download_callback("ytv720:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeVideo720));
-        assert_eq!(id, "abc123");
-
-        let (kind, id) = parse_youtube_download_callback("ytv1440:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeVideo1440));
-        assert_eq!(id, "abc123");
-
-        let (kind, id) = parse_youtube_download_callback("ytv2160:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeVideo2160));
-        assert_eq!(id, "abc123");
-
-        let (kind, id) = parse_youtube_download_callback("ytv:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeVideo1024));
-        assert_eq!(id, "abc123");
-        assert!(parse_youtube_download_callback("ig:abc123").is_none());
-    }
-}
-
-fn check_download_limit(limiter: &DownloadLimiter, user_id: UserId) -> Result<(), u64> {
+fn reserve_download_slot(limiter: &DownloadLimiter, user_id: UserId) -> Result<(), u64> {
     let now = Instant::now();
     let mut downloads = limiter.lock().expect("download limiter lock poisoned");
 
@@ -413,36 +309,43 @@ fn check_download_limit(limiter: &DownloadLimiter, user_id: UserId) -> Result<()
     Ok(())
 }
 
+fn release_download_slot(limiter: &DownloadLimiter, user_id: UserId) {
+    let mut downloads = limiter.lock().expect("download limiter lock poisoned");
+    downloads.remove(&user_id);
+}
+
 async fn handle_inline_query(
     bot: Bot,
     q: InlineQuery,
-    limiter: DownloadLimiter,
+    _limiter: DownloadLimiter,
 ) -> ResponseResult<()> {
     let results = if let Some(link) = find_download_link(&q.query) {
-        if link.kind.is_inline_video() {
-            match check_download_limit(&limiter, q.from.id) {
-                Ok(()) => match prepare_inline_video(&bot, &q, &link).await {
-                    Ok(result) => vec![InlineQueryResult::CachedVideo(result)],
-                    Err(e) => vec![inline_article(
-                        "error",
-                        "Failed to prepare video",
-                        format!("Failed to prepare inline video: {e}"),
-                        "Try sending the link directly to the bot chat.",
-                    )],
-                },
-                Err(wait_secs) => vec![inline_article(
-                    "rate-limited",
-                    "Wait before next download",
-                    format!("Please wait {wait_secs}s before starting another download."),
-                    "Limit: 1 download per minute per user.",
-                )],
-            }
+        if link.kind.is_youtube() {
+            vec![inline_article(
+                "send-youtube-to-chat",
+                "Open bot chat to choose quality",
+                format!(
+                    "Send this YouTube link to the bot chat to choose quality or audio:\n{}",
+                    link.url
+                ),
+                "Inline queries answer instantly; downloads run in bot chat.",
+            )]
+        } else if link.kind.is_inline_video() {
+            vec![inline_article(
+                "send-video-to-chat",
+                "Open bot chat to download",
+                format!(
+                    "Send this link to the bot chat to download it:\n{}",
+                    link.url
+                ),
+                "Inline queries answer instantly; downloads run in bot chat.",
+            )]
         } else {
             vec![inline_article(
                 "audio-not-supported",
-                "Inline video mode needs a video link",
+                "Open bot chat to download",
                 link.url.to_string(),
-                "YouTube watch links are still handled as audio in bot chat.",
+                "Downloads run in bot chat.",
             )]
         }
     } else {
@@ -475,88 +378,6 @@ fn inline_article(
         )
         .description(description),
     )
-}
-
-async fn prepare_inline_video(
-    bot: &Bot,
-    q: &InlineQuery,
-    link: &DownloadLink<'_>,
-) -> Result<InlineQueryResultCachedVideo, String> {
-    let tmp_path = std::env::temp_dir().join(format!("{}.mp4", Uuid::new_v4()));
-    let title = fetch_title(link.url)
-        .await
-        .unwrap_or_else(|| "video".into());
-
-    log_inline_download_link(link.kind.inline_title(), link.url, q).await;
-
-    let status_msg = bot
-        .send_message(q.from.id, "Preparing inline video...")
-        .await
-        .map_err(|e| format!("Cannot send progress message: {e}"))?;
-    let progress_chat_id = status_msg.chat.id;
-
-    let result = async {
-        download_with_progress(
-            link.url,
-            &tmp_path,
-            link.kind.format_args(),
-            bot,
-            progress_chat_id,
-            status_msg.id,
-        )
-        .await?;
-
-        let metadata = tokio::fs::metadata(&tmp_path)
-            .await
-            .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
-        if metadata.len() > MAX_TG_SIZE {
-            return Err(format!(
-                "Downloaded video is too large for inline upload ({:.1}MB)",
-                metadata.len() as f64 / 1024.0 / 1024.0
-            ));
-        }
-
-        bot.edit_message_text(progress_chat_id, status_msg.id, "Uploading to Telegram...")
-            .await
-            .ok();
-
-        let file = InputFile::file(&tmp_path).file_name(format!("{title}.mp4"));
-        let uploaded = bot
-            .send_video(q.from.id, file)
-            .await
-            .map_err(|e| format!("Telegram upload error: {e}"))?;
-        let file_id = uploaded
-            .video()
-            .map(|video| video.file.id.clone())
-            .ok_or_else(|| "Telegram response did not contain a video".to_string())?;
-
-        bot.edit_message_text(progress_chat_id, status_msg.id, "Ready in inline results.")
-            .await
-            .ok();
-        bot.delete_message(progress_chat_id, status_msg.id)
-            .await
-            .ok();
-
-        Ok(
-            InlineQueryResultCachedVideo::new("video-file", file_id, title)
-                .description("Send downloaded video")
-                .caption(link.url.to_string()),
-        )
-    }
-    .await;
-
-    if let Err(e) = &result {
-        bot.edit_message_text(
-            progress_chat_id,
-            status_msg.id,
-            format!("Inline video failed: {e}"),
-        )
-        .await
-        .ok();
-    }
-
-    let _ = tokio::fs::remove_file(&tmp_path).await;
-    result
 }
 
 async fn send_youtube_menu(
@@ -675,7 +496,7 @@ async fn handle_callback_query(
         return Ok(());
     };
 
-    if let Err(wait_secs) = check_download_limit(&limiter, q.from.id) {
+    if let Err(wait_secs) = reserve_download_slot(&limiter, q.from.id) {
         bot.answer_callback_query(q.id)
             .text(format!(
                 "Please wait {wait_secs}s before starting another download."
@@ -699,6 +520,7 @@ async fn handle_callback_query(
         .ok();
 
     if let Err(e) = download_and_send_media(&bot, chat_id, status_msg_id, kind, &url).await {
+        release_download_slot(&limiter, q.from.id);
         bot.edit_message_text(chat_id, status_msg_id, format!("Download failed: {e}"))
             .await?;
     }
@@ -730,10 +552,16 @@ async fn handle_message(
         return Ok(());
     }
 
-    if let Some(user) = msg.from.as_ref() {
-        if let Err(wait_secs) = check_download_limit(&limiter, user.id) {
-            bot.send_message(
+    let status_msg = bot
+        .send_message(msg.chat.id, link.kind.downloading_message())
+        .await?;
+
+    let user_id = msg.from.as_ref().map(|user| user.id);
+    if let Some(user_id) = user_id {
+        if let Err(wait_secs) = reserve_download_slot(&limiter, user_id) {
+            bot.edit_message_text(
                 msg.chat.id,
+                status_msg.id,
                 format!("Please wait {wait_secs}s before starting another download."),
             )
             .await?;
@@ -743,13 +571,12 @@ async fn handle_message(
 
     log_download_link(link.kind.log_kind(), link.url, &msg).await;
 
-    let status_msg = bot
-        .send_message(msg.chat.id, link.kind.downloading_message())
-        .await?;
-
     if let Err(e) =
         download_and_send_media(&bot, msg.chat.id, status_msg.id, link.kind, link.url).await
     {
+        if let Some(user_id) = user_id {
+            release_download_slot(&limiter, user_id);
+        }
         bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
             .await?;
     }
@@ -758,60 +585,24 @@ async fn handle_message(
 }
 
 async fn log_download_link(kind: &str, url: &str, msg: &Message) {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
     let user_id = msg
         .from
         .as_ref()
         .map(|user| user.id.0.to_string())
         .unwrap_or_else(|| "unknown".into());
-    let line = format!("{ts}\t{kind}\tuser={user_id}\t{url}\n");
-
-    match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("download_links.log")
-        .await
-    {
-        Ok(mut file) => {
-            if let Err(e) = file.write_all(line.as_bytes()).await {
-                log::warn!("Failed to write download_links.log: {e}");
-            }
-        }
-        Err(e) => log::warn!("Failed to open download_links.log: {e}"),
-    }
-}
-
-async fn log_inline_download_link(kind: &str, url: &str, q: &InlineQuery) {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
-    let line = format!("{ts}\tinline_{kind}\tuser={}\t{url}\n", q.from.id);
-
-    match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("download_links.log")
-        .await
-    {
-        Ok(mut file) => {
-            if let Err(e) = file.write_all(line.as_bytes()).await {
-                log::warn!("Failed to write download_links.log: {e}");
-            }
-        }
-        Err(e) => log::warn!("Failed to open download_links.log: {e}"),
-    }
+    append_download_log(kind, &user_id, url).await;
 }
 
 async fn log_callback_download_link(kind: &str, url: &str, q: &CallbackQuery) {
+    append_download_log(&format!("callback_{kind}"), &q.from.id.to_string(), url).await;
+}
+
+async fn append_download_log(kind: &str, user_id: &str, url: &str) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let line = format!("{ts}\tcallback_{kind}\tuser={}\t{url}\n", q.from.id);
+    let line = format!("{ts}\t{kind}\tuser={user_id}\t{url}\n");
 
     match tokio::fs::OpenOptions::new()
         .create(true)
@@ -1133,7 +924,7 @@ async fn split_media(path: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
         .map_err(|e| format!("Cannot read file: {e}"))?
         .len();
 
-    let num_chunks = (file_size / MAX_TG_SIZE) + 1;
+    let num_chunks = chunk_count(file_size, MAX_TG_SIZE);
 
     // Get total duration via ffprobe
     let probe = tokio::process::Command::new("ffprobe")
@@ -1205,5 +996,147 @@ async fn split_media(path: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
         return Err("No chunks produced by ffmpeg".into());
     }
 
+    if let Err(e) = validate_chunk_sizes(&chunks).await {
+        for chunk in &chunks {
+            let _ = tokio::fs::remove_file(chunk).await;
+        }
+        return Err(e);
+    }
+
     Ok(chunks)
+}
+
+fn chunk_count(file_size: u64, max_size: u64) -> u64 {
+    file_size.div_ceil(max_size).max(1)
+}
+
+async fn validate_chunk_sizes(chunks: &[PathBuf]) -> Result<(), String> {
+    for chunk in chunks {
+        let size = tokio::fs::metadata(chunk)
+            .await
+            .map_err(|e| format!("Cannot read split chunk {}: {e}", chunk.display()))?
+            .len();
+
+        if size > MAX_TG_SIZE {
+            return Err(format!(
+                "Split chunk {} is too large ({:.1}MB)",
+                chunk.display(),
+                size as f64 / 1024.0 / 1024.0
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_x_video_status_link() {
+        let link = find_download_link(
+            "watch https://x.com/example_user/status/1800000000000000000?s=46&t=test",
+        )
+        .expect("x.com status link should be detected");
+
+        assert!(matches!(link.kind, DownloadKind::XVideo));
+        assert_eq!(
+            link.url,
+            "https://x.com/example_user/status/1800000000000000000?s=46&t=test"
+        );
+    }
+
+    #[test]
+    fn x_video_download_args_concat_playlist_entries() {
+        assert_eq!(
+            DownloadKind::XVideo.format_args(),
+            &[
+                "-f",
+                "best[ext=mp4][height<=720]/best[height<=720]/mp4",
+                "--concat-playlist",
+                "always"
+            ]
+        );
+    }
+
+    #[test]
+    fn youtube_video_download_args_prefer_1024p_or_best_available() {
+        assert_eq!(
+            DownloadKind::YouTubeVideo.format_args(),
+            &[
+                "-f",
+                "bestvideo[height<=1024][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1024]+bestaudio/best[height<=1024][ext=mp4]/best[height<=1024]/best",
+                "--merge-output-format",
+                "mp4"
+            ]
+        );
+    }
+
+    #[test]
+    fn youtube_quality_download_args_use_selected_height() {
+        assert!(DownloadKind::YouTubeVideo360.format_args()[1].contains("height<=360"));
+        assert!(DownloadKind::YouTubeVideo480.format_args()[1].contains("height<=480"));
+        assert!(DownloadKind::YouTubeVideo720.format_args()[1].contains("height<=720"));
+        assert_eq!(
+            DownloadKind::YouTubeVideo1024.format_args(),
+            DownloadKind::YouTubeVideo.format_args()
+        );
+        assert!(DownloadKind::YouTubeVideo1440.format_args()[1].contains("height<=1440"));
+        assert!(DownloadKind::YouTubeVideo2160.format_args()[1].contains("height<=2160"));
+    }
+
+    #[test]
+    fn youtube_watch_link_defaults_to_video_menu() {
+        let link = find_download_link("watch https://www.youtube.com/watch?v=Sv5ZZB-M59Q")
+            .expect("youtube watch link should be detected");
+
+        assert!(matches!(link.kind, DownloadKind::YouTubeVideo));
+        assert!(link.kind.is_youtube());
+    }
+
+    #[test]
+    fn parses_youtube_download_callback_choice() {
+        let (kind, id) = parse_youtube_download_callback("yta:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeAudio));
+        assert_eq!(id, "abc123");
+
+        let (kind, id) = parse_youtube_download_callback("ytv720:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeVideo720));
+        assert_eq!(id, "abc123");
+
+        let (kind, id) = parse_youtube_download_callback("ytv1440:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeVideo1440));
+        assert_eq!(id, "abc123");
+
+        let (kind, id) = parse_youtube_download_callback("ytv2160:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeVideo2160));
+        assert_eq!(id, "abc123");
+
+        let (kind, id) = parse_youtube_download_callback("ytv:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::YouTubeVideo1024));
+        assert_eq!(id, "abc123");
+        assert!(parse_youtube_download_callback("ig:abc123").is_none());
+    }
+
+    #[test]
+    fn chunk_count_uses_ceiling_without_extra_exact_multiple() {
+        assert_eq!(chunk_count(0, MAX_TG_SIZE), 1);
+        assert_eq!(chunk_count(1, MAX_TG_SIZE), 1);
+        assert_eq!(chunk_count(MAX_TG_SIZE, MAX_TG_SIZE), 1);
+        assert_eq!(chunk_count(MAX_TG_SIZE + 1, MAX_TG_SIZE), 2);
+        assert_eq!(chunk_count(MAX_TG_SIZE * 2, MAX_TG_SIZE), 2);
+    }
+
+    #[test]
+    fn download_slot_can_be_released_after_failure() {
+        let limiter: DownloadLimiter = Arc::new(Mutex::new(HashMap::new()));
+        let user_id = UserId(42);
+
+        reserve_download_slot(&limiter, user_id).unwrap();
+        assert!(reserve_download_slot(&limiter, user_id).is_err());
+
+        release_download_slot(&limiter, user_id);
+        assert!(reserve_download_slot(&limiter, user_id).is_ok());
+    }
 }

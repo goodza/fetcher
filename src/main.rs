@@ -670,6 +670,10 @@ fn add_cookie_args(cmd: &mut tokio::process::Command) {
     }
 }
 
+fn should_use_cookies(url: &str) -> bool {
+    !X_RE.is_match(url)
+}
+
 fn cookie_file_path() -> Option<PathBuf> {
     let cwd_path = PathBuf::from("cookies.txt");
     if cwd_path.exists() {
@@ -756,7 +760,11 @@ async fn download_with_progress(
         output.to_str().unwrap(),
         url,
     ]);
-    add_cookie_args(&mut cmd);
+    // X guest-token extraction works without authentication. Stale browser
+    // cookies can instead make its GraphQL endpoint reject the request.
+    if should_use_cookies(url) {
+        add_cookie_args(&mut cmd);
+    }
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
@@ -844,7 +852,9 @@ async fn fetch_metadata_field(url: &str, field: &str) -> Option<String> {
         "ejs:github",
         url,
     ]);
-    add_cookie_args(&mut cmd);
+    if should_use_cookies(url) {
+        add_cookie_args(&mut cmd);
+    }
     let output = cmd.output().await.ok()?;
     let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if title.is_empty() {
@@ -1094,6 +1104,16 @@ mod tests {
                 "always"
             ]
         );
+    }
+
+    #[test]
+    fn x_video_uses_guest_token_instead_of_cookies() {
+        assert!(!should_use_cookies(
+            "https://x.com/vtchakarova/status/2075991968006439402"
+        ));
+        assert!(should_use_cookies(
+            "https://www.youtube.com/watch?v=Sv5ZZB-M59Q"
+        ));
     }
 
     #[test]

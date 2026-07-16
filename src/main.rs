@@ -239,6 +239,11 @@ static YT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/watch\?[^\s]*v=[A-Za-z0-9_-]+|youtu\.be/[A-Za-z0-9_-]+)")
         .unwrap()
 });
+static HTTP_LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://[^\s]+").unwrap());
+
+fn contains_http_link(text: &str) -> bool {
+    HTTP_LINK_RE.is_match(text)
+}
 
 fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
     if let Some(m) = IG_RE.find(text) {
@@ -347,6 +352,13 @@ async fn handle_inline_query(
                 "Downloads run in bot chat.",
             )]
         }
+    } else if contains_http_link(&q.query) {
+        vec![inline_article(
+            "unsupported-link",
+            "Unsupported link",
+            "This link is not supported.",
+            "Supported: Instagram Reels, X videos, and YouTube videos or Shorts.",
+        )]
     } else {
         vec![inline_article(
             "help",
@@ -545,6 +557,13 @@ async fn handle_message(
     }
 
     let Some(link) = find_download_link(text) else {
+        if contains_http_link(text) {
+            bot.send_message(
+                msg.chat.id,
+                "Unsupported link. Supported: Instagram Reels, X videos, and YouTube videos or Shorts.",
+            )
+            .await?;
+        }
         return Ok(());
     };
 
@@ -846,6 +865,31 @@ async fn fetch_metadata_field(url: &str, field: &str) -> Option<String> {
 
 const MAX_TG_SIZE: u64 = 49 * 1024 * 1024;
 
+fn is_request_entity_too_large(error: &teloxide::RequestError) -> bool {
+    matches!(
+        error,
+        teloxide::RequestError::Api(teloxide::ApiError::RequestEntityTooLarge)
+    )
+}
+
+async fn send_video_with_document_fallback(
+    bot: &Bot,
+    chat_id: ChatId,
+    path: &Path,
+    file_name: String,
+) -> Result<(), teloxide::RequestError> {
+    let video = InputFile::file(path).file_name(file_name.clone());
+    match bot.send_video(chat_id, video).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_request_entity_too_large(&error) => {
+            log::info!("Telegram rejected video upload as too large; retrying as document");
+            let document = InputFile::file(path).file_name(file_name);
+            bot.send_document(chat_id, document).await.map(|_| ())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn send_audio(
     bot: &Bot,
     chat_id: ChatId,
@@ -905,10 +949,9 @@ async fn send_video(
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
     if metadata.len() <= MAX_TG_SIZE {
-        let file = InputFile::file(path).file_name(format!("{title}.mp4"));
-        bot.send_video(chat_id, file)
+        send_video_with_document_fallback(bot, chat_id, path, format!("{title}.mp4"))
             .await
-            .map_err(|e| format!("Telegram API error: {e}"))?;
+            .map_err(|e| format!("Telegram API error sending file: {e}"))?;
         return Ok(());
     }
 
@@ -918,10 +961,15 @@ async fn send_video(
             metadata.len() as f64 / 1024.0 / 1024.0
         );
         let file = InputFile::file(path).file_name(format!("{title}.mp4"));
-        bot.send_document(chat_id, file)
-            .await
-            .map_err(|e| format!("Telegram API error sending file: {e}"))?;
-        return Ok(());
+        match bot.send_document(chat_id, file).await {
+            Ok(_) => return Ok(()),
+            Err(error) if is_request_entity_too_large(&error) => {
+                log::info!(
+                    "Telegram rejected document upload as too large; splitting into smaller parts"
+                );
+            }
+            Err(error) => return Err(format!("Telegram API error sending file: {error}")),
+        }
     }
 
     let chunks = split_media(path, "mp4").await?;
@@ -932,8 +980,7 @@ async fn send_video(
         } else {
             title.to_string()
         };
-        let file = InputFile::file(chunk).file_name(format!("{label}.mp4"));
-        bot.send_video(chat_id, file)
+        send_video_with_document_fallback(bot, chat_id, chunk, format!("{label}.mp4"))
             .await
             .map_err(|e| format!("Telegram API error on chunk {}: {e}", i + 1))?;
     }
@@ -1152,6 +1199,15 @@ mod tests {
     }
 
     #[test]
+    fn detects_unsupported_http_links() {
+        assert!(contains_http_link(
+            "download https://www.tiktok.com/@user/video/123"
+        ));
+        assert!(contains_http_link("try http://example.com/video"));
+        assert!(!contains_http_link("hello, no link here"));
+    }
+
+    #[test]
     fn parses_youtube_download_callback_choice() {
         let (kind, id) = parse_youtube_download_callback("yta:abc123").unwrap();
         assert!(matches!(kind, DownloadKind::YouTubeAudio));
@@ -1182,6 +1238,15 @@ mod tests {
         assert_eq!(chunk_count(MAX_TG_SIZE, MAX_TG_SIZE), 1);
         assert_eq!(chunk_count(MAX_TG_SIZE + 1, MAX_TG_SIZE), 2);
         assert_eq!(chunk_count(MAX_TG_SIZE * 2, MAX_TG_SIZE), 2);
+    }
+
+    #[test]
+    fn recognizes_request_entity_too_large_for_document_fallback() {
+        let too_large = teloxide::RequestError::Api(teloxide::ApiError::RequestEntityTooLarge);
+        let other = teloxide::RequestError::Api(teloxide::ApiError::ChatNotFound);
+
+        assert!(is_request_entity_too_large(&too_large));
+        assert!(!is_request_entity_too_large(&other));
     }
 
     #[test]

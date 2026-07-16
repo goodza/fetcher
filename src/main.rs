@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-const DOWNLOAD_COOLDOWN: Duration = Duration::from_secs(60);
+const DOWNLOAD_COOLDOWN: Duration = Duration::from_secs(10);
 type DownloadLimiter = Arc<Mutex<HashMap<UserId, Instant>>>;
 type DownloadStore = Arc<Mutex<HashMap<String, String>>>;
 
@@ -58,7 +58,6 @@ enum DownloadKind {
     XVideo,
     YouTubeShort,
     YouTubeVideo,
-    YouTubeVideo360,
     YouTubeVideo480,
     YouTubeVideo720,
     YouTubeVideo1024,
@@ -75,7 +74,6 @@ impl DownloadKind {
                 | Self::XVideo
                 | Self::YouTubeShort
                 | Self::YouTubeVideo
-                | Self::YouTubeVideo360
                 | Self::YouTubeVideo480
                 | Self::YouTubeVideo720
                 | Self::YouTubeVideo1024
@@ -89,7 +87,6 @@ impl DownloadKind {
             self,
             Self::YouTubeShort
                 | Self::YouTubeVideo
-                | Self::YouTubeVideo360
                 | Self::YouTubeVideo480
                 | Self::YouTubeVideo720
                 | Self::YouTubeVideo1024
@@ -103,7 +100,6 @@ impl DownloadKind {
         matches!(
             self,
             Self::YouTubeVideo
-                | Self::YouTubeVideo360
                 | Self::YouTubeVideo480
                 | Self::YouTubeVideo720
                 | Self::YouTubeVideo1024
@@ -118,7 +114,6 @@ impl DownloadKind {
             Self::XVideo => "x",
             Self::YouTubeShort => "youtube_shorts",
             Self::YouTubeVideo => "youtube_video",
-            Self::YouTubeVideo360 => "youtube_video_360",
             Self::YouTubeVideo480 => "youtube_video_480",
             Self::YouTubeVideo720 => "youtube_video_720",
             Self::YouTubeVideo1024 => "youtube_video_1024",
@@ -134,7 +129,6 @@ impl DownloadKind {
             Self::XVideo => "Downloading X video...",
             Self::YouTubeShort
             | Self::YouTubeVideo
-            | Self::YouTubeVideo360
             | Self::YouTubeVideo480
             | Self::YouTubeVideo720
             | Self::YouTubeVideo1024
@@ -188,12 +182,6 @@ impl DownloadKind {
             Self::YouTubeVideo480 => &[
                 "-f",
                 "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480][ext=mp4]/best[height<=480]/best",
-                "--merge-output-format",
-                "mp4",
-            ],
-            Self::YouTubeVideo360 => &[
-                "-f",
-                "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360][ext=mp4]/best[height<=360]/best",
                 "--merge-output-format",
                 "mp4",
             ],
@@ -277,12 +265,8 @@ fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
 }
 
 fn parse_youtube_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
-    data.strip_prefix("ytv360:")
-        .map(|id| (DownloadKind::YouTubeVideo360, id))
-        .or_else(|| {
-            data.strip_prefix("ytv480:")
-                .map(|id| (DownloadKind::YouTubeVideo480, id))
-        })
+    data.strip_prefix("ytv480:")
+        .map(|id| (DownloadKind::YouTubeVideo480, id))
         .or_else(|| {
             data.strip_prefix("ytv720:")
                 .map(|id| (DownloadKind::YouTubeVideo720, id))
@@ -409,15 +393,11 @@ async fn send_youtube_menu(
 
     let keyboard = InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("360p", format!("ytv360:{id}")),
             InlineKeyboardButton::callback("480p", format!("ytv480:{id}")),
-        ],
-        vec![
             InlineKeyboardButton::callback("720p", format!("ytv720:{id}")),
-            InlineKeyboardButton::callback("1024p", format!("ytv1024:{id}")),
         ],
         vec![
-            InlineKeyboardButton::callback("2K", format!("ytv1440:{id}")),
+            InlineKeyboardButton::callback("1024p", format!("ytv1024:{id}")),
             InlineKeyboardButton::callback("4K", format!("ytv2160:{id}")),
         ],
         vec![InlineKeyboardButton::callback("Audio", format!("yta:{id}"))],
@@ -1152,7 +1132,6 @@ mod tests {
 
     #[test]
     fn youtube_quality_download_args_use_selected_height() {
-        assert!(DownloadKind::YouTubeVideo360.format_args()[1].contains("height<=360"));
         assert!(DownloadKind::YouTubeVideo480.format_args()[1].contains("height<=480"));
         assert!(DownloadKind::YouTubeVideo720.format_args()[1].contains("height<=720"));
         assert_eq!(

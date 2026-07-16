@@ -17,8 +17,16 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 const DOWNLOAD_COOLDOWN: Duration = Duration::from_secs(10);
+const DOWNLOAD_MENU_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_DOWNLOAD_MENUS: usize = 1_024;
 type DownloadLimiter = Arc<Mutex<HashMap<UserId, Instant>>>;
-type DownloadStore = Arc<Mutex<HashMap<String, String>>>;
+
+struct DownloadMenu {
+    url: String,
+    created_at: Instant,
+}
+
+type DownloadStore = Arc<Mutex<HashMap<String, DownloadMenu>>>;
 
 #[tokio::main]
 async fn main() {
@@ -318,6 +326,47 @@ fn release_download_slot(limiter: &DownloadLimiter, user_id: UserId) {
     downloads.remove(&user_id);
 }
 
+fn prune_download_menus(downloads: &mut HashMap<String, DownloadMenu>, now: Instant) {
+    downloads.retain(|_, menu| now.saturating_duration_since(menu.created_at) < DOWNLOAD_MENU_TTL);
+}
+
+fn insert_download_menu(
+    downloads: &mut HashMap<String, DownloadMenu>,
+    id: String,
+    url: String,
+    now: Instant,
+) {
+    prune_download_menus(downloads, now);
+
+    while downloads.len() >= MAX_DOWNLOAD_MENUS {
+        let Some(oldest_id) = downloads
+            .iter()
+            .min_by_key(|(_, menu)| menu.created_at)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        downloads.remove(&oldest_id);
+    }
+
+    downloads.insert(
+        id,
+        DownloadMenu {
+            url,
+            created_at: now,
+        },
+    );
+}
+
+fn get_download_url(
+    downloads: &mut HashMap<String, DownloadMenu>,
+    id: &str,
+    now: Instant,
+) -> Option<String> {
+    prune_download_menus(downloads, now);
+    downloads.get(id).map(|menu| menu.url.clone())
+}
+
 async fn handle_inline_query(
     bot: Bot,
     q: InlineQuery,
@@ -400,7 +449,7 @@ async fn send_youtube_menu(
     let id = Uuid::new_v4().to_string();
     {
         let mut downloads = downloads.lock().expect("download store lock poisoned");
-        downloads.insert(id.clone(), url.to_string());
+        insert_download_menu(&mut downloads, id.clone(), url.to_string(), Instant::now());
     }
 
     let keyboard = InlineKeyboardMarkup::new(vec![
@@ -415,9 +464,16 @@ async fn send_youtube_menu(
         vec![InlineKeyboardButton::callback("Audio", format!("yta:{id}"))],
     ]);
 
-    bot.send_message(chat_id, "Choose quality or audio:")
+    let result = bot
+        .send_message(chat_id, "Choose quality or audio:")
         .reply_markup(keyboard)
-        .await?;
+        .await;
+
+    if result.is_err() {
+        let mut downloads = downloads.lock().expect("download store lock poisoned");
+        downloads.remove(&id);
+    }
+    result?;
 
     Ok(())
 }
@@ -498,8 +554,8 @@ async fn handle_callback_query(
     let status_msg_id = message.id;
 
     let url = {
-        let downloads = downloads.lock().expect("download store lock poisoned");
-        downloads.get(id).cloned()
+        let mut downloads = downloads.lock().expect("download store lock poisoned");
+        get_download_url(&mut downloads, id, Instant::now())
     };
     let Some(url) = url else {
         bot.answer_callback_query(q.id)
@@ -1229,6 +1285,40 @@ mod tests {
         assert!(matches!(kind, DownloadKind::YouTubeVideo1024));
         assert_eq!(id, "abc123");
         assert!(parse_youtube_download_callback("ig:abc123").is_none());
+    }
+
+    #[test]
+    fn download_menu_store_expires_abandoned_menus() {
+        let now = Instant::now();
+        let mut downloads = HashMap::new();
+        downloads.insert(
+            "expired".into(),
+            DownloadMenu {
+                url: "https://youtu.be/expired".into(),
+                created_at: now - DOWNLOAD_MENU_TTL,
+            },
+        );
+
+        assert_eq!(get_download_url(&mut downloads, "expired", now), None);
+        assert!(downloads.is_empty());
+    }
+
+    #[test]
+    fn download_menu_store_is_capped() {
+        let now = Instant::now();
+        let mut downloads = HashMap::new();
+
+        for index in 0..=MAX_DOWNLOAD_MENUS {
+            insert_download_menu(
+                &mut downloads,
+                format!("menu-{index}"),
+                format!("https://youtu.be/{index}"),
+                now,
+            );
+        }
+
+        assert_eq!(downloads.len(), MAX_DOWNLOAD_MENUS);
+        assert!(downloads.contains_key(&format!("menu-{MAX_DOWNLOAD_MENUS}")));
     }
 
     #[test]

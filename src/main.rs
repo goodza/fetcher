@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, LazyLock, Mutex,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,16 +10,47 @@ use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle,
-    InputFile, InputMessageContent, InputMessageContentText, MessageId, UserId,
+    InputFile, InputMessageContent, InputMessageContentText, MessageId,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-const DOWNLOAD_COOLDOWN: Duration = Duration::from_secs(10);
 const DOWNLOAD_MENU_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_DOWNLOAD_MENUS: usize = 1_024;
-type DownloadLimiter = Arc<Mutex<HashMap<UserId, Instant>>>;
+
+struct DownloadQueueState {
+    semaphore: Arc<Semaphore>,
+    waiting: AtomicUsize,
+}
+
+type DownloadQueue = Arc<DownloadQueueState>;
+
+fn new_download_queue(max_concurrent: usize) -> DownloadQueue {
+    Arc::new(DownloadQueueState {
+        semaphore: Arc::new(Semaphore::new(max_concurrent)),
+        waiting: AtomicUsize::new(0),
+    })
+}
+
+fn parse_max_concurrent_downloads(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be greater than zero".into()),
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("must be a positive integer: {error}")),
+    }
+}
+
+struct WaitingDownload {
+    queue: DownloadQueue,
+}
+
+impl Drop for WaitingDownload {
+    fn drop(&mut self) {
+        self.queue.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 struct DownloadMenu {
     url: String,
@@ -39,13 +70,17 @@ async fn main() {
     check_cookies().await;
 
     let token = std::env::var("TG_TOKEN").expect("TG_TOKEN must be set");
+    let max_concurrent_downloads =
+        std::env::var("MAX_CONCURRENT_DOWNLOADS").expect("MAX_CONCURRENT_DOWNLOADS must be set");
+    let max_concurrent_downloads = parse_max_concurrent_downloads(&max_concurrent_downloads)
+        .expect("MAX_CONCURRENT_DOWNLOADS must be a positive integer");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("Failed to build HTTP client");
     let bot = Bot::with_client(token, client);
-    let limiter: DownloadLimiter = Arc::new(Mutex::new(HashMap::new()));
+    let queue = new_download_queue(max_concurrent_downloads);
     let downloads: DownloadStore = Arc::new(Mutex::new(HashMap::new()));
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handle_message))
@@ -53,7 +88,7 @@ async fn main() {
         .branch(Update::filter_callback_query().endpoint(handle_callback_query));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![limiter, downloads])
+        .dependencies(dptree::deps![queue, downloads])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -306,24 +341,52 @@ fn parse_youtube_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
         })
 }
 
-fn reserve_download_slot(limiter: &DownloadLimiter, user_id: UserId) -> Result<(), u64> {
-    let now = Instant::now();
-    let mut downloads = limiter.lock().expect("download limiter lock poisoned");
-
-    if let Some(last_download) = downloads.get(&user_id) {
-        let elapsed = last_download.elapsed();
-        if elapsed < DOWNLOAD_COOLDOWN {
-            return Err((DOWNLOAD_COOLDOWN - elapsed).as_secs().max(1));
-        }
-    }
-
-    downloads.insert(user_id, now);
-    Ok(())
+fn register_waiting_download(queue: &DownloadQueue) -> (usize, WaitingDownload) {
+    let position = queue.waiting.fetch_add(1, Ordering::SeqCst) + 1;
+    (
+        position,
+        WaitingDownload {
+            queue: Arc::clone(queue),
+        },
+    )
 }
 
-fn release_download_slot(limiter: &DownloadLimiter, user_id: UserId) {
-    let mut downloads = limiter.lock().expect("download limiter lock poisoned");
-    downloads.remove(&user_id);
+async fn acquire_download_permit(
+    queue: &DownloadQueue,
+    bot: &Bot,
+    chat_id: ChatId,
+    status_msg_id: MessageId,
+) -> OwnedSemaphorePermit {
+    match Arc::clone(&queue.semaphore).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            let (position, waiting) = register_waiting_download(queue);
+            let acquire = Arc::clone(&queue.semaphore).acquire_owned();
+            tokio::pin!(acquire);
+
+            let queued_text = format!("Queued… Position: {position}");
+            let queued_message = async {
+                bot.edit_message_text(chat_id, status_msg_id, queued_text)
+                    .await
+            };
+            tokio::pin!(queued_message);
+
+            // Poll the semaphore acquisition first so Tokio registers this waiter
+            // before the Telegram status update can yield to a newer request.
+            let permit = tokio::select! {
+                biased;
+                result = &mut acquire => result,
+                _ = &mut queued_message => acquire.await,
+            }
+            .expect("download queue semaphore unexpectedly closed");
+
+            drop(waiting);
+            permit
+        }
+        Err(TryAcquireError::Closed) => {
+            panic!("download queue semaphore unexpectedly closed")
+        }
+    }
 }
 
 fn prune_download_menus(downloads: &mut HashMap<String, DownloadMenu>, now: Instant) {
@@ -358,19 +421,19 @@ fn insert_download_menu(
     );
 }
 
-fn get_download_url(
+fn take_download_url(
     downloads: &mut HashMap<String, DownloadMenu>,
     id: &str,
     now: Instant,
 ) -> Option<String> {
     prune_download_menus(downloads, now);
-    downloads.get(id).map(|menu| menu.url.clone())
+    downloads.remove(id).map(|menu| menu.url)
 }
 
 async fn handle_inline_query(
     bot: Bot,
     q: InlineQuery,
-    _limiter: DownloadLimiter,
+    _queue: DownloadQueue,
 ) -> ResponseResult<()> {
     let results = if let Some(link) = find_download_link(&q.query) {
         if link.kind.is_youtube() {
@@ -533,7 +596,7 @@ async fn download_and_send_media(
 async fn handle_callback_query(
     bot: Bot,
     q: CallbackQuery,
-    limiter: DownloadLimiter,
+    queue: DownloadQueue,
     downloads: DownloadStore,
 ) -> ResponseResult<()> {
     let Some(data) = q.data.as_deref() else {
@@ -555,7 +618,7 @@ async fn handle_callback_query(
 
     let url = {
         let mut downloads = downloads.lock().expect("download store lock poisoned");
-        get_download_url(&mut downloads, id, Instant::now())
+        take_download_url(&mut downloads, id, Instant::now())
     };
     let Some(url) = url else {
         bot.answer_callback_query(q.id)
@@ -565,31 +628,21 @@ async fn handle_callback_query(
         return Ok(());
     };
 
-    if let Err(wait_secs) = reserve_download_slot(&limiter, q.from.id) {
-        bot.answer_callback_query(q.id)
-            .text(format!(
-                "Please wait {wait_secs}s before starting another download."
-            ))
-            .show_alert(true)
-            .await?;
-        return Ok(());
-    }
-
-    {
-        let mut downloads = downloads.lock().expect("download store lock poisoned");
-        downloads.remove(id);
-    }
-
     bot.answer_callback_query(q.id.clone()).await?;
 
-    log_callback_download_link(kind.log_kind(), &url, &q).await;
+    let result = {
+        let _permit = acquire_download_permit(&queue, &bot, chat_id, status_msg_id).await;
 
-    bot.edit_message_text(chat_id, status_msg_id, kind.downloading_message())
-        .await
-        .ok();
+        log_callback_download_link(kind.log_kind(), &url, &q).await;
 
-    if let Err(e) = download_and_send_media(&bot, chat_id, status_msg_id, kind, &url).await {
-        release_download_slot(&limiter, q.from.id);
+        bot.edit_message_text(chat_id, status_msg_id, kind.downloading_message())
+            .await
+            .ok();
+
+        download_and_send_media(&bot, chat_id, status_msg_id, kind, &url).await
+    };
+
+    if let Err(e) = result {
         bot.edit_message_text(chat_id, status_msg_id, format!("Download failed: {e}"))
             .await?;
     }
@@ -600,7 +653,7 @@ async fn handle_callback_query(
 async fn handle_message(
     bot: Bot,
     msg: Message,
-    limiter: DownloadLimiter,
+    queue: DownloadQueue,
     downloads: DownloadStore,
 ) -> ResponseResult<()> {
     let text = match msg.text() {
@@ -632,27 +685,19 @@ async fn handle_message(
         .send_message(msg.chat.id, link.kind.downloading_message())
         .await?;
 
-    let user_id = msg.from.as_ref().map(|user| user.id);
-    if let Some(user_id) = user_id {
-        if let Err(wait_secs) = reserve_download_slot(&limiter, user_id) {
-            bot.edit_message_text(
-                msg.chat.id,
-                status_msg.id,
-                format!("Please wait {wait_secs}s before starting another download."),
-            )
-            .await?;
-            return Ok(());
-        }
-    }
+    let result = {
+        let _permit = acquire_download_permit(&queue, &bot, msg.chat.id, status_msg.id).await;
 
-    log_download_link(link.kind.log_kind(), link.url, &msg).await;
+        log_download_link(link.kind.log_kind(), link.url, &msg).await;
 
-    if let Err(e) =
+        bot.edit_message_text(msg.chat.id, status_msg.id, link.kind.downloading_message())
+            .await
+            .ok();
+
         download_and_send_media(&bot, msg.chat.id, status_msg.id, link.kind, link.url).await
-    {
-        if let Some(user_id) = user_id {
-            release_download_slot(&limiter, user_id);
-        }
+    };
+
+    if let Err(e) = result {
         bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
             .await?;
     }
@@ -1299,7 +1344,7 @@ mod tests {
             },
         );
 
-        assert_eq!(get_download_url(&mut downloads, "expired", now), None);
+        assert_eq!(take_download_url(&mut downloads, "expired", now), None);
         assert!(downloads.is_empty());
     }
 
@@ -1340,14 +1385,69 @@ mod tests {
     }
 
     #[test]
-    fn download_slot_can_be_released_after_failure() {
-        let limiter: DownloadLimiter = Arc::new(Mutex::new(HashMap::new()));
-        let user_id = UserId(42);
+    fn download_queue_limits_concurrency() {
+        let queue = new_download_queue(2);
+        let first = Arc::clone(&queue.semaphore).try_acquire_owned().unwrap();
+        let second = Arc::clone(&queue.semaphore).try_acquire_owned().unwrap();
 
-        reserve_download_slot(&limiter, user_id).unwrap();
-        assert!(reserve_download_slot(&limiter, user_id).is_err());
+        assert!(matches!(
+            Arc::clone(&queue.semaphore).try_acquire_owned(),
+            Err(TryAcquireError::NoPermits)
+        ));
 
-        release_download_slot(&limiter, user_id);
-        assert!(reserve_download_slot(&limiter, user_id).is_ok());
+        drop(first);
+        assert!(Arc::clone(&queue.semaphore).try_acquire_owned().is_ok());
+        drop(second);
+    }
+
+    #[test]
+    fn parses_positive_max_concurrent_downloads() {
+        assert_eq!(parse_max_concurrent_downloads("1"), Ok(1));
+        assert_eq!(parse_max_concurrent_downloads("4"), Ok(4));
+        assert!(parse_max_concurrent_downloads("0").is_err());
+        assert!(parse_max_concurrent_downloads("invalid").is_err());
+    }
+
+    #[test]
+    fn waiting_position_is_released_when_waiter_is_dropped() {
+        let queue = new_download_queue(2);
+        let (first_position, first_waiter) = register_waiting_download(&queue);
+        let (second_position, _second_waiter) = register_waiting_download(&queue);
+
+        assert_eq!(first_position, 1);
+        assert_eq!(second_position, 2);
+
+        drop(first_waiter);
+        let (replacement_position, _replacement_waiter) = register_waiting_download(&queue);
+        assert_eq!(replacement_position, 2);
+    }
+
+    #[tokio::test]
+    async fn download_queue_admits_waiters_in_fifo_order() {
+        let queue = new_download_queue(1);
+        let active = Arc::clone(&queue.semaphore).acquire_owned().await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let first_semaphore = Arc::clone(&queue.semaphore);
+        let first_tx = tx.clone();
+        let first = tokio::spawn(async move {
+            let _permit = first_semaphore.acquire_owned().await.unwrap();
+            first_tx.send(1).unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let second_semaphore = Arc::clone(&queue.semaphore);
+        let second = tokio::spawn(async move {
+            let _permit = second_semaphore.acquire_owned().await.unwrap();
+            tx.send(2).unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        drop(active);
+
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, Some(2));
+        first.await.unwrap();
+        second.await.unwrap();
     }
 }

@@ -267,7 +267,10 @@ struct DownloadLink<'a> {
 }
 
 static IG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_-]+").unwrap()
+    Regex::new(
+        r"https?://(?:www\.)?instagram\.com/(?:[A-Za-z0-9._]+/)?(?:reel|reels)/[A-Za-z0-9_-]+/?",
+    )
+    .unwrap()
 });
 static X_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -1206,6 +1209,18 @@ async fn validate_chunk_sizes(chunks: &[PathBuf]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_username_prefixed_instagram_reel_link() {
+        let link = find_download_link("https://www.instagram.com/kolka_elf/reel/DbHN_ovssLw/")
+            .expect("username-prefixed Instagram reel link should be detected");
+
+        assert!(matches!(link.kind, DownloadKind::InstagramReel));
+        assert_eq!(
+            link.url,
+            "https://www.instagram.com/kolka_elf/reel/DbHN_ovssLw/"
+        );
+    }
 
     #[test]
     fn finds_x_video_status_link() {

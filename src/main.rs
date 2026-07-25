@@ -279,7 +279,7 @@ static YT_SHORTS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)").unwrap()
 });
 static YT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/watch\?[^\s]*v=[A-Za-z0-9_-]+|youtu\.be/[A-Za-z0-9_-]+)")
+    Regex::new(r"https?://(?:(?:www\.|m\.)?youtube\.com/(?:watch\?[^\s]*v=[A-Za-z0-9_-]+|live/[A-Za-z0-9_-]+(?:[?#][^\s]*)?)|youtu\.be/[A-Za-z0-9_-]+)")
         .unwrap()
 });
 static HTTP_LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://[^\s]+").unwrap());
@@ -1297,6 +1297,21 @@ mod tests {
 
         assert!(matches!(link.kind, DownloadKind::YouTubeVideo));
         assert!(link.kind.is_youtube());
+    }
+
+    #[test]
+    fn youtube_live_link_defaults_to_video_menu() {
+        let link = find_download_link(
+            "stream https://www.youtube.com/live/xskUOJfevBU?is=08Tgh2OuqZm5P4pC",
+        )
+        .expect("youtube live link should be detected");
+
+        assert!(matches!(link.kind, DownloadKind::YouTubeVideo));
+        assert!(link.kind.is_youtube());
+        assert_eq!(
+            link.url,
+            "https://www.youtube.com/live/xskUOJfevBU?is=08Tgh2OuqZm5P4pC"
+        );
     }
 
     #[test]

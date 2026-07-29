@@ -1,3 +1,4 @@
 target/
-cookies.txt
+*.txt
+*.srt
 *.sh

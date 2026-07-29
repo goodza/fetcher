@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -98,6 +98,7 @@ async fn main() {
 #[derive(Clone, Copy)]
 enum DownloadKind {
     InstagramReel,
+    InstagramProfile,
     XVideo,
     YouTubeShort,
     YouTubeVideo,
@@ -114,6 +115,7 @@ impl DownloadKind {
         matches!(
             self,
             Self::InstagramReel
+                | Self::InstagramProfile
                 | Self::XVideo
                 | Self::YouTubeShort
                 | Self::YouTubeVideo
@@ -154,6 +156,7 @@ impl DownloadKind {
     fn log_kind(self) -> &'static str {
         match self {
             Self::InstagramReel => "instagram",
+            Self::InstagramProfile => "instagram_profile",
             Self::XVideo => "x",
             Self::YouTubeShort => "youtube_shorts",
             Self::YouTubeVideo => "youtube_video",
@@ -169,6 +172,7 @@ impl DownloadKind {
     fn downloading_message(self) -> &'static str {
         match self {
             Self::InstagramReel => "Downloading reel...",
+            Self::InstagramProfile => "Scrolling profile Reels...",
             Self::XVideo => "Downloading X video...",
             Self::YouTubeShort
             | Self::YouTubeVideo
@@ -268,10 +272,12 @@ struct DownloadLink<'a> {
 
 static IG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"https?://(?:www\.)?instagram\.com/(?:[A-Za-z0-9._]+/)?(?:reel|reels)/[A-Za-z0-9_-]+/?",
+        r"https?://(?:www\.)?instagram\.com/(?:[A-Za-z0-9._]+/)?(?:reel|reels)/([A-Za-z0-9_-]+)/?",
     )
     .unwrap()
 });
+static IG_PROFILE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9._]+)/?").unwrap());
 static X_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"https?://(?:(?:www\.|mobile\.)?x\.com)/(?:[A-Za-z0-9_]+|i)/status/\d+(?:[/?#][^\s]*)?",
@@ -296,6 +302,18 @@ fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
         Some(DownloadLink {
             kind: DownloadKind::InstagramReel,
             url: m.as_str(),
+        })
+    } else if let Some(captures) = IG_PROFILE_RE.captures(text) {
+        let username = captures.get(1)?.as_str();
+        if matches!(
+            username.to_ascii_lowercase().as_str(),
+            "reel" | "reels" | "p" | "stories" | "explore"
+        ) {
+            return None;
+        }
+        Some(DownloadLink {
+            kind: DownloadKind::InstagramProfile,
+            url: captures.get(0)?.as_str(),
         })
     } else if let Some(m) = X_RE.find(text) {
         Some(DownloadLink {
@@ -472,14 +490,14 @@ async fn handle_inline_query(
             "unsupported-link",
             "Unsupported link",
             "This link is not supported.",
-            "Supported: Instagram Reels, X videos, and YouTube videos or Shorts.",
+            "Supported: Instagram profiles or Reels, X videos, and YouTube videos or Shorts.",
         )]
     } else {
         vec![inline_article(
             "help",
-            "Paste an Instagram Reel, X video, or YouTube Short link",
-            "Paste an Instagram Reel, X video, or YouTube Short link after the bot username.",
-            "Example: @fetcher_bot https://www.instagram.com/reel/...",
+            "Paste an Instagram profile or video link",
+            "Paste an Instagram profile or Reel, X video, or YouTube link after the bot username.",
+            "Example: @fetcher_bot https://www.instagram.com/example/",
         )]
     };
 
@@ -551,6 +569,14 @@ async fn download_and_send_media(
     kind: DownloadKind,
     url: &str,
 ) -> Result<(), String> {
+    if matches!(kind, DownloadKind::InstagramProfile) {
+        let result = download_instagram_profile_and_send(bot, chat_id, status_msg_id, url).await;
+        if result.is_ok() {
+            bot.delete_message(chat_id, status_msg_id).await.ok();
+        }
+        return result;
+    }
+
     let tmp_path =
         std::env::temp_dir().join(format!("{}.{}", Uuid::new_v4(), kind.output_extension()));
 
@@ -593,6 +619,438 @@ async fn download_and_send_media(
         bot.delete_message(chat_id, status_msg_id).await.ok();
     }
 
+    result
+}
+
+fn instagram_profile_username(url: &str) -> Option<&str> {
+    IG_PROFILE_RE
+        .captures(url)
+        .and_then(|captures| captures.get(1))
+        .map(|username| username.as_str())
+}
+
+async fn webdriver_json(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<serde_json::Value>,
+    operation: &str,
+) -> Result<serde_json::Value, String> {
+    let mut request = client.request(method, url);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("Browser {operation} failed: {e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Cannot read browser {operation} response: {e}"))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "Browser {operation} returned HTTP {status}: {body}"
+        ));
+    }
+
+    let response: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Browser {operation} returned invalid JSON: {e}"))?;
+    if let Some(error) = response
+        .pointer("/value/error")
+        .and_then(serde_json::Value::as_str)
+    {
+        let message = response
+            .pointer("/value/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(error);
+        return Err(format!("Browser {operation} failed: {message}"));
+    }
+    Ok(response)
+}
+
+fn instagram_webdriver_cookies() -> Vec<serde_json::Value> {
+    let Some(cookie_file) = cookie_file_path() else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(cookie_file) else {
+        return Vec::new();
+    };
+
+    contents
+        .lines()
+        .filter_map(|raw_line| {
+            let line = raw_line.strip_prefix("#HttpOnly_").unwrap_or(raw_line);
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() < 7 || !fields[0].ends_with("instagram.com") {
+                return None;
+            }
+
+            let mut cookie = serde_json::json!({
+                "name": fields[5],
+                "value": fields[6],
+                "path": fields[2],
+                "domain": fields[0],
+                "secure": fields[3].eq_ignore_ascii_case("TRUE"),
+            });
+            if let Ok(expiry) = fields[4].parse::<u64>() {
+                if expiry > 0 {
+                    cookie["expiry"] = serde_json::json!(expiry);
+                }
+            }
+            Some(cookie)
+        })
+        .collect()
+}
+
+fn instagram_reel_shortcode(url: &str) -> Option<&str> {
+    IG_RE
+        .captures(url)
+        .and_then(|captures| captures.get(1))
+        .map(|shortcode| shortcode.as_str())
+}
+
+async fn scrape_instagram_reel_urls(
+    client: &reqwest::Client,
+    webdriver_url: &str,
+    session_id: &str,
+    username: &str,
+) -> Result<Vec<String>, String> {
+    let session_url = format!("{webdriver_url}/session/{session_id}");
+
+    webdriver_json(
+        client,
+        reqwest::Method::POST,
+        &format!("{session_url}/url"),
+        Some(serde_json::json!({"url": "https://www.instagram.com/"})),
+        "opening Instagram",
+    )
+    .await?;
+
+    for cookie in instagram_webdriver_cookies() {
+        if let Err(error) = webdriver_json(
+            client,
+            reqwest::Method::POST,
+            &format!("{session_url}/cookie"),
+            Some(serde_json::json!({"cookie": cookie})),
+            "loading an Instagram cookie",
+        )
+        .await
+        {
+            log::warn!("{error}");
+        }
+    }
+
+    let reels_page = format!("https://www.instagram.com/{username}/reels/");
+    webdriver_json(
+        client,
+        reqwest::Method::POST,
+        &format!("{session_url}/url"),
+        Some(serde_json::json!({"url": reels_page})),
+        "opening the Instagram Reels page",
+    )
+    .await?;
+
+    let execute_url = format!("{session_url}/execute/sync");
+    let mut seen_shortcodes = HashSet::new();
+    let mut urls = Vec::new();
+    let mut last_height = 0_u64;
+    let mut unchanged_rounds = 0_u8;
+    let mut reached_end = false;
+
+    // Instagram virtualizes long grids, so collect links before every scroll
+    // instead of parsing only the final DOM.
+    for _ in 0..600 {
+        let response = webdriver_json(
+            client,
+            reqwest::Method::POST,
+            &execute_url,
+            Some(serde_json::json!({
+                "script": r#"
+                    const urls = Array.from(document.querySelectorAll('a[href]'))
+                        .map(anchor => anchor.href)
+                        .filter(url => /\/(?:[A-Za-z0-9._]+\/)?reels?\/[A-Za-z0-9_-]+\/?/.test(url));
+                    const height = Math.max(
+                        document.body?.scrollHeight || 0,
+                        document.documentElement?.scrollHeight || 0
+                    );
+                    const text = document.body?.innerText || '';
+                    const pageUrl = location.href;
+                    window.scrollTo(0, height);
+                    return {urls, height, text: text.slice(0, 4000), pageUrl};
+                "#,
+                "args": [],
+            })),
+            "reading and scrolling the Instagram Reels page",
+        )
+        .await?;
+        let value = response
+            .get("value")
+            .ok_or_else(|| "Browser returned no page data".to_string())?;
+        let page_url = value
+            .get("pageUrl")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if page_url.contains("/accounts/login") {
+            return Err(
+                "Instagram opened the login page; refresh the Instagram cookies.txt session".into(),
+            );
+        }
+
+        let before = urls.len();
+        if let Some(found_urls) = value.get("urls").and_then(serde_json::Value::as_array) {
+            for found_url in found_urls.iter().filter_map(serde_json::Value::as_str) {
+                let Some(shortcode) = instagram_reel_shortcode(found_url) else {
+                    continue;
+                };
+                if seen_shortcodes.insert(shortcode.to_string()) {
+                    urls.push(format!("https://www.instagram.com/reel/{shortcode}/"));
+                }
+            }
+        }
+
+        let height = value
+            .get("height")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        if urls.len() == before && height == last_height {
+            unchanged_rounds += 1;
+        } else {
+            unchanged_rounds = 0;
+        }
+        if unchanged_rounds >= 6 {
+            reached_end = true;
+            break;
+        }
+        last_height = height;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+
+    if !reached_end {
+        Err("Instagram scrolling did not reach a stable bottom; refusing to return a possibly incomplete Reel list".into())
+    } else if urls.is_empty() {
+        Err("No Reel links were found while scrolling this Instagram profile; the profile may be private, unavailable, or require fresh cookies".into())
+    } else {
+        Ok(urls)
+    }
+}
+
+async fn gather_instagram_reel_urls(username: &str) -> Result<Vec<String>, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("Cannot reserve a ChromeDriver port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Cannot read the ChromeDriver port: {e}"))?
+        .port();
+    drop(listener);
+
+    let chromedriver = std::env::var("CHROMEDRIVER").unwrap_or_else(|_| "chromedriver".to_string());
+    let mut driver = tokio::process::Command::new(chromedriver)
+        .arg(format!("--port={port}"))
+        .arg("--allowed-ips=127.0.0.1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Cannot start ChromeDriver: {e}"))?;
+
+    let webdriver_url = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("Cannot create browser-control client: {e}"))?;
+
+    let mut ready = false;
+    for _ in 0..50 {
+        if client
+            .get(format!("{webdriver_url}/status"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !ready {
+        let _ = driver.kill().await;
+        return Err("ChromeDriver did not become ready".into());
+    }
+
+    let mut chrome_args = vec![
+        "--headless=new".to_string(),
+        "--no-sandbox".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--window-size=1280,1000".to_string(),
+        "--lang=en-US".to_string(),
+    ];
+    if let Ok(extra_args) = std::env::var("INSTAGRAM_CHROME_ARGS") {
+        chrome_args.extend(extra_args.split_whitespace().map(str::to_string));
+    }
+    let mut chrome_options = serde_json::json!({"args": chrome_args});
+    if let Ok(binary) = std::env::var("CHROME_BINARY") {
+        chrome_options["binary"] = serde_json::Value::String(binary);
+    }
+
+    let session = webdriver_json(
+        &client,
+        reqwest::Method::POST,
+        &format!("{webdriver_url}/session"),
+        Some(serde_json::json!({
+            "capabilities": {
+                "alwaysMatch": {
+                    "browserName": "chrome",
+                    "pageLoadStrategy": "eager",
+                    "goog:chromeOptions": chrome_options,
+                }
+            }
+        })),
+        "session creation",
+    )
+    .await;
+    let session_id = match session {
+        Ok(session) => session
+            .pointer("/value/sessionId")
+            .or_else(|| session.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "ChromeDriver returned no session ID".to_string()),
+        Err(error) => Err(error),
+    };
+    let session_id = match session_id {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            let _ = driver.kill().await;
+            return Err(error);
+        }
+    };
+
+    let result = scrape_instagram_reel_urls(&client, &webdriver_url, &session_id, username).await;
+    let _ = webdriver_json(
+        &client,
+        reqwest::Method::DELETE,
+        &format!("{webdriver_url}/session/{session_id}"),
+        None,
+        "session cleanup",
+    )
+    .await;
+    let _ = driver.kill().await;
+    result
+}
+
+async fn concatenate_videos(inputs: &[PathBuf], output: &Path) -> Result<(), String> {
+    if inputs.len() == 1 {
+        tokio::fs::copy(&inputs[0], output)
+            .await
+            .map_err(|e| format!("Cannot copy the downloaded Reel: {e}"))?;
+        return Ok(());
+    }
+
+    let list_path = output.with_extension("txt");
+    let list = inputs
+        .iter()
+        .map(|path| format!("file '{}'\n", path.display()))
+        .collect::<String>();
+    tokio::fs::write(&list_path, list)
+        .await
+        .map_err(|e| format!("Cannot create ffmpeg concat list: {e}"))?;
+
+    let result = tokio::process::Command::new("ffmpeg")
+        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&list_path)
+        .args(["-c", "copy", "-movflags", "+faststart"])
+        .arg(output)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ffmpeg: {e}"));
+    let _ = tokio::fs::remove_file(&list_path).await;
+    let result = result?;
+
+    if !result.status.success() {
+        let details = String::from_utf8_lossy(&result.stderr)
+            .lines()
+            .last()
+            .unwrap_or("ffmpeg exited with an error")
+            .to_string();
+        return Err(format!("ffmpeg concat failed: {details}"));
+    }
+
+    Ok(())
+}
+
+async fn download_instagram_profile_and_send(
+    bot: &Bot,
+    chat_id: ChatId,
+    status_msg_id: MessageId,
+    url: &str,
+) -> Result<(), String> {
+    let username = instagram_profile_username(url)
+        .ok_or_else(|| "Cannot determine the Instagram username".to_string())?;
+    let work_dir = std::env::temp_dir().join(format!("instagram-profile-{}", Uuid::new_v4()));
+    tokio::fs::create_dir(&work_dir)
+        .await
+        .map_err(|e| format!("Cannot create temporary directory: {e}"))?;
+
+    let result = async {
+        bot.edit_message_text(chat_id, status_msg_id, "Scrolling profile Reels...")
+            .await
+            .ok();
+        let reel_urls = gather_instagram_reel_urls(username).await?;
+        let mut videos = Vec::with_capacity(reel_urls.len());
+
+        for (index, reel_url) in reel_urls.iter().enumerate() {
+            bot.edit_message_text(
+                chat_id,
+                status_msg_id,
+                format!("Downloading Reel {}/{}...", index + 1, reel_urls.len()),
+            )
+            .await
+            .ok();
+            let path = work_dir.join(format!("{index:05}.mp4"));
+            download_with_progress(
+                reel_url,
+                &path,
+                DownloadKind::InstagramReel.format_args(),
+                DownloadKind::InstagramReel.metadata_args(),
+                bot,
+                chat_id,
+                status_msg_id,
+            )
+            .await?;
+            videos.push(path);
+        }
+
+        bot.edit_message_text(
+            chat_id,
+            status_msg_id,
+            format!("Concatenating {} Reels...", videos.len()),
+        )
+        .await
+        .ok();
+        let output = work_dir.join("reels.mp4");
+        concatenate_videos(&videos, &output).await?;
+
+        bot.edit_message_text(chat_id, status_msg_id, "Sending video...")
+            .await
+            .ok();
+        send_video(
+            bot,
+            chat_id,
+            &output,
+            &format!("{username} reels"),
+            DownloadKind::InstagramProfile,
+        )
+        .await
+    }
+    .await;
+
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
     result
 }
 
@@ -672,7 +1130,7 @@ async fn handle_message(
         if contains_http_link(text) {
             bot.send_message(
                 msg.chat.id,
-                "Unsupported link. Supported: Instagram Reels, X videos, and YouTube videos or Shorts.",
+                "Unsupported link. Supported: Instagram profiles or Reels, X videos, and YouTube videos or Shorts.",
             )
             .await?;
         }
@@ -1211,6 +1669,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finds_instagram_profile_link() {
+        let link = find_download_link("https://www.instagram.com/kolka_elf")
+            .expect("Instagram profile link should be detected");
+
+        assert!(matches!(link.kind, DownloadKind::InstagramProfile));
+        assert_eq!(link.url, "https://www.instagram.com/kolka_elf");
+        assert_eq!(instagram_profile_username(link.url), Some("kolka_elf"));
+    }
+
+    #[test]
     fn finds_username_prefixed_instagram_reel_link() {
         let link = find_download_link("https://www.instagram.com/kolka_elf/reel/DbHN_ovssLw/")
             .expect("username-prefixed Instagram reel link should be detected");
@@ -1220,6 +1688,16 @@ mod tests {
             link.url,
             "https://www.instagram.com/kolka_elf/reel/DbHN_ovssLw/"
         );
+        assert_eq!(instagram_reel_shortcode(link.url), Some("DbHN_ovssLw"));
+        assert_eq!(
+            instagram_reel_shortcode("https://www.instagram.com/reels/DbHN_ovssLw/"),
+            Some("DbHN_ovssLw")
+        );
+    }
+
+    #[test]
+    fn instagram_reel_route_is_not_treated_as_a_profile() {
+        assert!(find_download_link("https://www.instagram.com/reel/").is_none());
     }
 
     #[test]

@@ -245,7 +245,7 @@ impl DownloadKind {
                 "mp4",
             ],
             Self::YouTubeAudio => &["-x", "--audio-format", "mp3"],
-            _ => &["-f", "mp4"],
+            _ => &["-f", "b[ext=mp4]"],
         }
     }
 
@@ -1724,6 +1724,14 @@ mod tests {
                 "--concat-playlist",
                 "always"
             ]
+        );
+    }
+
+    #[test]
+    fn instagram_download_args_request_premerged_mp4_without_warning() {
+        assert_eq!(
+            DownloadKind::InstagramReel.format_args(),
+            &["-f", "b[ext=mp4]"]
         );
     }
 

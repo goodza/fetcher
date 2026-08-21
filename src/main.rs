@@ -1104,6 +1104,11 @@ async fn handle_callback_query(
     };
 
     if let Err(e) = result {
+        notify_error(&format!(
+            "ERROR fetcher {} download failed: {e} ({url})",
+            kind.log_kind()
+        ))
+        .await;
         bot.edit_message_text(chat_id, status_msg_id, format!("Download failed: {e}"))
             .await?;
     }
@@ -1159,6 +1164,12 @@ async fn handle_message(
     };
 
     if let Err(e) = result {
+        notify_error(&format!(
+            "ERROR fetcher {} download failed: {e} ({})",
+            link.kind.log_kind(),
+            link.url
+        ))
+        .await;
         bot.edit_message_text(msg.chat.id, status_msg.id, format!("Download failed: {e}"))
             .await?;
     }
@@ -1177,6 +1188,35 @@ async fn log_download_link(kind: &str, url: &str, msg: &Message) {
 
 async fn log_callback_download_link(kind: &str, url: &str, q: &CallbackQuery) {
     append_download_log(&format!("callback_{kind}"), &q.from.id.to_string(), url).await;
+}
+
+async fn notify_error(message: &str) {
+    let url = std::env::var("ALERT_URL")
+        .unwrap_or_else(|_| "http://localhost:8888/a8b51bf17307430afbd820648d8490a3".to_string());
+
+    let body = serde_json::json!({ "msg": message, "url": "" });
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            log::warn!("Failed to build alert webhook client: {e}");
+            return;
+        }
+    };
+
+    match client.post(&url).json(&body).send().await {
+        Ok(response) if response.status().is_success() => {
+            log::info!("Error notification delivered to {url}");
+        }
+        Ok(response) => {
+            log::warn!("Alert webhook returned HTTP {}: {url}", response.status());
+        }
+        Err(e) => {
+            log::warn!("Failed to send error notification to {url}: {e}");
+        }
+    }
 }
 
 async fn append_download_log(kind: &str, user_id: &str, url: &str) {
@@ -1294,9 +1334,17 @@ async fn check_cookies() {
                 .last()
                 .unwrap_or("yt-dlp exited with an error");
             log::error!("yt-dlp cookie check failed: {details}");
+            notify_error(&format!(
+                "ERROR fetcher yt-dlp cookie check failed: {details}"
+            ))
+            .await;
         }
         Err(e) => {
             log::error!("yt-dlp cookie check failed to run: {e}");
+            notify_error(&format!(
+                "ERROR fetcher yt-dlp cookie check failed to run: {e}"
+            ))
+            .await;
         }
     }
 }

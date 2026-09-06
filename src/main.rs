@@ -110,6 +110,9 @@ enum DownloadKind {
     InstagramReel,
     InstagramPost,
     InstagramProfile,
+    InstagramProfileReels,
+    InstagramProfilePhotos,
+    InstagramProfileBoth,
     XVideo,
     YouTubeShort,
     YouTubeVideo,
@@ -120,11 +123,7 @@ impl DownloadKind {
     fn is_inline_video(self) -> bool {
         matches!(
             self,
-            Self::InstagramReel
-                | Self::InstagramProfile
-                | Self::XVideo
-                | Self::YouTubeShort
-                | Self::YouTubeVideo
+            Self::InstagramReel | Self::XVideo | Self::YouTubeShort | Self::YouTubeVideo
         )
     }
 
@@ -135,11 +134,21 @@ impl DownloadKind {
         )
     }
 
+    fn is_instagram_profile_download(self) -> bool {
+        matches!(
+            self,
+            Self::InstagramProfileReels | Self::InstagramProfilePhotos | Self::InstagramProfileBoth
+        )
+    }
+
     fn log_kind(self) -> &'static str {
         match self {
             Self::InstagramReel => "instagram",
             Self::InstagramPost => "instagram_post",
             Self::InstagramProfile => "instagram_profile",
+            Self::InstagramProfileReels => "instagram_profile_reels",
+            Self::InstagramProfilePhotos => "instagram_profile_photos",
+            Self::InstagramProfileBoth => "instagram_profile_both",
             Self::XVideo => "x",
             Self::YouTubeShort => "youtube_shorts",
             Self::YouTubeVideo => "youtube_video",
@@ -152,6 +161,9 @@ impl DownloadKind {
             Self::InstagramReel => "Downloading reel...",
             Self::InstagramPost => "Downloading post photos...",
             Self::InstagramProfile => "Scrolling profile Reels...",
+            Self::InstagramProfileReels => "Scrolling profile Reels...",
+            Self::InstagramProfilePhotos => "Scrolling profile photos...",
+            Self::InstagramProfileBoth => "Scrolling profile media...",
             Self::XVideo => "Downloading X video...",
             Self::YouTubeShort | Self::YouTubeVideo => "Downloading video...",
             Self::YouTubeAudio => "Downloading audio...",
@@ -161,7 +173,7 @@ impl DownloadKind {
     fn title_fallback(self) -> &'static str {
         match self {
             Self::YouTubeAudio => "audio",
-            Self::InstagramPost => "photo",
+            Self::InstagramPost | Self::InstagramProfilePhotos => "photo",
             _ => "video",
         }
     }
@@ -169,7 +181,7 @@ impl DownloadKind {
     fn output_extension(self) -> &'static str {
         match self {
             Self::YouTubeAudio => "mp3",
-            Self::InstagramPost => "jpg",
+            Self::InstagramPost | Self::InstagramProfilePhotos => "jpg",
             _ => "mp4",
         }
     }
@@ -196,7 +208,7 @@ impl DownloadKind {
                 "mp4",
             ],
             Self::YouTubeAudio => &["-x", "--audio-format", "mp3"],
-            Self::InstagramPost => &[],
+            Self::InstagramPost | Self::InstagramProfilePhotos => &[],
             _ => &["-f", "b[ext=mp4]"],
         }
     }
@@ -213,6 +225,7 @@ impl DownloadKind {
         match self {
             Self::YouTubeAudio => "Sending audio...",
             Self::InstagramPost => "Sending photos...",
+            Self::InstagramProfilePhotos => "Sending photos...",
             _ => "Sending video...",
         }
     }
@@ -302,6 +315,24 @@ fn parse_youtube_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
             data.strip_prefix("yta:")
                 .map(|id| (DownloadKind::YouTubeAudio, id))
         })
+}
+
+fn parse_instagram_profile_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
+    data.strip_prefix("igpr:")
+        .map(|id| (DownloadKind::InstagramProfileReels, id))
+        .or_else(|| {
+            data.strip_prefix("igpp:")
+                .map(|id| (DownloadKind::InstagramProfilePhotos, id))
+        })
+        .or_else(|| {
+            data.strip_prefix("igpb:")
+                .map(|id| (DownloadKind::InstagramProfileBoth, id))
+        })
+}
+
+fn parse_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
+    parse_youtube_download_callback(data)
+        .or_else(|| parse_instagram_profile_download_callback(data))
 }
 
 fn register_waiting_download(queue: &DownloadQueue) -> (usize, WaitingDownload) {
@@ -409,6 +440,16 @@ async fn handle_inline_query(
                 ),
                 "Inline queries answer instantly; downloads run in bot chat.",
             )]
+        } else if matches!(link.kind, DownloadKind::InstagramProfile) {
+            vec![inline_article(
+                "send-instagram-profile-to-chat",
+                "Open bot chat to choose profile media",
+                format!(
+                    "Send this Instagram profile link to the bot chat to choose all Reels, all photos, or both:\n{}",
+                    link.url
+                ),
+                "Profile downloads run in bot chat after you choose what to download.",
+            )]
         } else if link.kind.is_inline_video() || matches!(link.kind, DownloadKind::InstagramPost) {
             vec![inline_article(
                 "send-video-to-chat",
@@ -497,6 +538,43 @@ async fn send_youtube_menu(
     Ok(())
 }
 
+async fn send_instagram_profile_menu(
+    bot: &Bot,
+    chat_id: ChatId,
+    url: &str,
+    downloads: &DownloadStore,
+) -> ResponseResult<()> {
+    let id = Uuid::new_v4().to_string();
+    {
+        let mut downloads = downloads.lock().expect("download store lock poisoned");
+        insert_download_menu(&mut downloads, id.clone(), url.to_string(), Instant::now());
+    }
+
+    let keyboard = InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("All reels", format!("igpr:{id}")),
+            InlineKeyboardButton::callback("All photos", format!("igpp:{id}")),
+        ],
+        vec![InlineKeyboardButton::callback("Both", format!("igpb:{id}"))],
+    ]);
+
+    let result = bot
+        .send_message(
+            chat_id,
+            "What would you like to download from this profile?",
+        )
+        .reply_markup(keyboard)
+        .await;
+
+    if result.is_err() {
+        let mut downloads = downloads.lock().expect("download store lock poisoned");
+        downloads.remove(&id);
+    }
+    result?;
+
+    Ok(())
+}
+
 async fn download_and_send_media(
     bot: &Bot,
     chat_id: ChatId,
@@ -512,8 +590,9 @@ async fn download_and_send_media(
         return result;
     }
 
-    if matches!(kind, DownloadKind::InstagramProfile) {
-        let result = download_instagram_profile_and_send(bot, chat_id, status_msg_id, url).await;
+    if kind.is_instagram_profile_download() {
+        let result =
+            download_instagram_profile_and_send(bot, chat_id, status_msg_id, kind, url).await;
         if result.is_ok() {
             bot.delete_message(chat_id, status_msg_id).await.ok();
         }
@@ -834,30 +913,46 @@ async fn send_instagram_photo_batch(
     first_index: usize,
     caption: &str,
 ) -> Result<(), String> {
-    if paths.len() == 1 {
-        let photo = InputFile::file(&paths[0])
-            .file_name(format!("instagram-photo-{}.jpg", first_index + 1));
-        bot.send_photo(chat_id, photo)
-            .caption(caption)
-            .await
-            .map_err(|e| format!("Telegram API error sending photo: {e}"))?;
-        return Ok(());
+    const MAX_ATTEMPTS: usize = 4;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let result = if paths.len() == 1 {
+            let photo = InputFile::file(&paths[0])
+                .file_name(format!("instagram-photo-{}.jpg", first_index + 1));
+            bot.send_photo(chat_id, photo)
+                .caption(caption)
+                .await
+                .map(|_| ())
+        } else {
+            let media = paths.iter().enumerate().map(|(offset, path)| {
+                let mut photo = InputMediaPhoto::new(
+                    InputFile::file(path)
+                        .file_name(format!("instagram-photo-{}.jpg", first_index + offset + 1)),
+                );
+                if offset == 0 {
+                    photo = photo.caption(caption);
+                }
+                InputMedia::Photo(photo)
+            });
+            bot.send_media_group(chat_id, media).await.map(|_| ())
+        };
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(teloxide::RequestError::RetryAfter(delay)) if attempt < MAX_ATTEMPTS => {
+                let wait = delay.duration() + Duration::from_secs(1);
+                log::warn!("Telegram rate-limited an Instagram photo batch; retrying in {wait:?}");
+                tokio::time::sleep(wait).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Telegram API error sending Instagram photos: {error}"
+                ));
+            }
+        }
     }
 
-    let media = paths.iter().enumerate().map(|(offset, path)| {
-        let mut photo = InputMediaPhoto::new(
-            InputFile::file(path)
-                .file_name(format!("instagram-photo-{}.jpg", first_index + offset + 1)),
-        );
-        if offset == 0 {
-            photo = photo.caption(caption);
-        }
-        InputMedia::Photo(photo)
-    });
-    bot.send_media_group(chat_id, media)
-        .await
-        .map_err(|e| format!("Telegram API error sending photo album: {e}"))?;
-    Ok(())
+    unreachable!("the Instagram photo send loop always returns")
 }
 
 async fn download_instagram_post_and_send(
@@ -926,12 +1021,63 @@ async fn download_instagram_post_and_send(
     result
 }
 
-async fn scrape_instagram_reel_urls(
+#[derive(Clone, Copy)]
+enum InstagramProfilePage {
+    Reels,
+    Photos,
+}
+
+impl InstagramProfilePage {
+    fn page_url(self, username: &str) -> String {
+        match self {
+            Self::Reels => format!("https://www.instagram.com/{username}/reels/"),
+            Self::Photos => format!("https://www.instagram.com/{username}/"),
+        }
+    }
+
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Reels => "reading and scrolling the Instagram Reels page",
+            Self::Photos => "reading and scrolling the Instagram profile page",
+        }
+    }
+
+    fn media_name(self) -> &'static str {
+        match self {
+            Self::Reels => "Reel",
+            Self::Photos => "photo post",
+        }
+    }
+
+    fn canonical_url(self, found_url: &str) -> Option<(String, String)> {
+        match self {
+            Self::Reels => instagram_reel_shortcode(found_url).map(|shortcode| {
+                (
+                    shortcode.to_string(),
+                    format!("https://www.instagram.com/reel/{shortcode}/"),
+                )
+            }),
+            Self::Photos => instagram_post_shortcode(found_url).map(|shortcode| {
+                (
+                    shortcode.to_string(),
+                    format!("https://www.instagram.com/p/{shortcode}/"),
+                )
+            }),
+        }
+    }
+}
+
+#[derive(Default)]
+struct InstagramProfileMediaUrls {
+    reels: Vec<String>,
+    posts: Vec<String>,
+}
+
+async fn initialize_instagram_webdriver_session(
     client: &reqwest::Client,
     webdriver_url: &str,
     session_id: &str,
-    username: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<(), String> {
     let session_url = format!("{webdriver_url}/session/{session_id}");
 
     webdriver_json(
@@ -957,13 +1103,24 @@ async fn scrape_instagram_reel_urls(
         }
     }
 
-    let reels_page = format!("https://www.instagram.com/{username}/reels/");
+    Ok(())
+}
+
+async fn scrape_instagram_profile_urls(
+    client: &reqwest::Client,
+    webdriver_url: &str,
+    session_id: &str,
+    username: &str,
+    page: InstagramProfilePage,
+) -> Result<Vec<String>, String> {
+    let session_url = format!("{webdriver_url}/session/{session_id}");
+
     webdriver_json(
         client,
         reqwest::Method::POST,
         &format!("{session_url}/url"),
-        Some(serde_json::json!({"url": reels_page})),
-        "opening the Instagram Reels page",
+        Some(serde_json::json!({"url": page.page_url(username)})),
+        "opening the Instagram profile page",
     )
     .await?;
 
@@ -984,8 +1141,7 @@ async fn scrape_instagram_reel_urls(
             Some(serde_json::json!({
                 "script": r#"
                     const urls = Array.from(document.querySelectorAll('a[href]'))
-                        .map(anchor => anchor.href)
-                        .filter(url => /\/(?:[A-Za-z0-9._]+\/)?reels?\/[A-Za-z0-9_-]+\/?/.test(url));
+                        .map(anchor => anchor.href);
                     const height = Math.max(
                         document.body?.scrollHeight || 0,
                         document.documentElement?.scrollHeight || 0
@@ -997,7 +1153,7 @@ async fn scrape_instagram_reel_urls(
                 "#,
                 "args": [],
             })),
-            "reading and scrolling the Instagram Reels page",
+            page.operation(),
         )
         .await?;
         let value = response
@@ -1016,11 +1172,11 @@ async fn scrape_instagram_reel_urls(
         let before = urls.len();
         if let Some(found_urls) = value.get("urls").and_then(serde_json::Value::as_array) {
             for found_url in found_urls.iter().filter_map(serde_json::Value::as_str) {
-                let Some(shortcode) = instagram_reel_shortcode(found_url) else {
+                let Some((shortcode, canonical_url)) = page.canonical_url(found_url) else {
                     continue;
                 };
-                if seen_shortcodes.insert(shortcode.to_string()) {
-                    urls.push(format!("https://www.instagram.com/reel/{shortcode}/"));
+                if seen_shortcodes.insert(shortcode) {
+                    urls.push(canonical_url);
                 }
             }
         }
@@ -1043,15 +1199,20 @@ async fn scrape_instagram_reel_urls(
     }
 
     if !reached_end {
-        Err("Instagram scrolling did not reach a stable bottom; refusing to return a possibly incomplete Reel list".into())
-    } else if urls.is_empty() {
-        Err("No Reel links were found while scrolling this Instagram profile; the profile may be private, unavailable, or require fresh cookies".into())
+        Err(format!(
+            "Instagram scrolling did not reach a stable bottom; refusing to return a possibly incomplete {} list",
+            page.media_name()
+        ))
     } else {
         Ok(urls)
     }
 }
 
-async fn gather_instagram_reel_urls(username: &str) -> Result<Vec<String>, String> {
+async fn gather_instagram_profile_media_urls(
+    username: &str,
+    include_reels: bool,
+    include_photos: bool,
+) -> Result<InstagramProfileMediaUrls, String> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .map_err(|e| format!("Cannot reserve a ChromeDriver port: {e}"))?;
     let port = listener
@@ -1142,7 +1303,37 @@ async fn gather_instagram_reel_urls(username: &str) -> Result<Vec<String>, Strin
         }
     };
 
-    let result = scrape_instagram_reel_urls(&client, &webdriver_url, &session_id, username).await;
+    let result = async {
+        initialize_instagram_webdriver_session(&client, &webdriver_url, &session_id).await?;
+
+        let reels = if include_reels {
+            scrape_instagram_profile_urls(
+                &client,
+                &webdriver_url,
+                &session_id,
+                username,
+                InstagramProfilePage::Reels,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        let posts = if include_photos {
+            scrape_instagram_profile_urls(
+                &client,
+                &webdriver_url,
+                &session_id,
+                username,
+                InstagramProfilePage::Photos,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(InstagramProfileMediaUrls { reels, posts })
+    }
+    .await;
     let _ = webdriver_json(
         &client,
         reqwest::Method::DELETE,
@@ -1199,58 +1390,176 @@ async fn download_instagram_profile_and_send(
     bot: &Bot,
     chat_id: ChatId,
     status_msg_id: MessageId,
+    kind: DownloadKind,
     url: &str,
 ) -> Result<(), String> {
     let username = instagram_profile_username(url)
         .ok_or_else(|| "Cannot determine the Instagram username".to_string())?;
+    let include_reels = matches!(
+        kind,
+        DownloadKind::InstagramProfileReels | DownloadKind::InstagramProfileBoth
+    );
+    let include_photos = matches!(
+        kind,
+        DownloadKind::InstagramProfilePhotos | DownloadKind::InstagramProfileBoth
+    );
     let work_dir = std::env::temp_dir().join(format!("instagram-profile-{}", Uuid::new_v4()));
     tokio::fs::create_dir(&work_dir)
         .await
         .map_err(|e| format!("Cannot create temporary directory: {e}"))?;
 
     let result = async {
-        bot.edit_message_text(chat_id, status_msg_id, "Scrolling profile Reels...")
+        bot.edit_message_text(chat_id, status_msg_id, kind.downloading_message())
             .await
             .ok();
-        let reel_urls = gather_instagram_reel_urls(username).await?;
-        let mut videos = Vec::with_capacity(reel_urls.len());
+        let media =
+            gather_instagram_profile_media_urls(username, include_reels, include_photos).await?;
+        let downloading_both = matches!(kind, DownloadKind::InstagramProfileBoth);
 
-        for (index, reel_url) in reel_urls.iter().enumerate() {
+        if include_reels && media.reels.is_empty() && !downloading_both {
+            return Err("No Reels were found on this Instagram profile".into());
+        }
+        if include_photos && media.posts.is_empty() && !downloading_both {
+            return Err("No photo posts were found on this Instagram profile".into());
+        }
+        if media.reels.is_empty() && media.posts.is_empty() {
+            return Err("No Reels or photo posts were found on this Instagram profile".into());
+        }
+
+        if include_reels && !media.reels.is_empty() {
+            let mut videos = Vec::with_capacity(media.reels.len());
+
+            for (index, reel_url) in media.reels.iter().enumerate() {
+                bot.edit_message_text(
+                    chat_id,
+                    status_msg_id,
+                    format!("Downloading Reel {}/{}...", index + 1, media.reels.len()),
+                )
+                .await
+                .ok();
+                let path = work_dir.join(format!("reel-{index:05}.mp4"));
+                download_with_progress(
+                    reel_url,
+                    &path,
+                    DownloadKind::InstagramReel.format_args(),
+                    DownloadKind::InstagramReel.metadata_args(),
+                    bot,
+                    chat_id,
+                    status_msg_id,
+                )
+                .await?;
+                videos.push(path);
+            }
+
             bot.edit_message_text(
                 chat_id,
                 status_msg_id,
-                format!("Downloading Reel {}/{}...", index + 1, reel_urls.len()),
+                format!("Concatenating {} Reels...", videos.len()),
             )
             .await
             .ok();
-            let path = work_dir.join(format!("{index:05}.mp4"));
-            download_with_progress(
-                reel_url,
-                &path,
-                DownloadKind::InstagramReel.format_args(),
-                DownloadKind::InstagramReel.metadata_args(),
-                bot,
-                chat_id,
-                status_msg_id,
-            )
-            .await?;
-            videos.push(path);
+            let output = work_dir.join("reels.mp4");
+            concatenate_videos(&videos, &output).await?;
+
+            bot.edit_message_text(chat_id, status_msg_id, "Sending Reels...")
+                .await
+                .ok();
+            send_video(bot, chat_id, &output, &format!("{username} reels"), url).await?;
         }
 
-        bot.edit_message_text(
-            chat_id,
-            status_msg_id,
-            format!("Concatenating {} Reels...", videos.len()),
-        )
-        .await
-        .ok();
-        let output = work_dir.join("reels.mp4");
-        concatenate_videos(&videos, &output).await?;
+        if include_photos && !media.posts.is_empty() {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("Cannot create Instagram client: {e}"))?;
+            let mut sent_photos = 0_usize;
+            let mut last_error = None;
+            let mut failed_posts = 0_usize;
 
-        bot.edit_message_text(chat_id, status_msg_id, "Sending video...")
-            .await
-            .ok();
-        send_video(bot, chat_id, &output, &format!("{username} reels"), url).await
+            for (post_index, post_url) in media.posts.iter().enumerate() {
+                bot.edit_message_text(
+                    chat_id,
+                    status_msg_id,
+                    format!(
+                        "Reading photo post {}/{}...",
+                        post_index + 1,
+                        media.posts.len()
+                    ),
+                )
+                .await
+                .ok();
+                let (shortcode, photo_urls) =
+                    match fetch_instagram_post_photo_urls(&client, post_url).await {
+                        Ok(post) => post,
+                        Err(error) => {
+                            log::warn!("Skipping Instagram profile post {post_url}: {error}");
+                            last_error = Some(error);
+                            failed_posts += 1;
+                            continue;
+                        }
+                    };
+                let mut paths = Vec::with_capacity(photo_urls.len());
+
+                for (photo_index, photo_url) in photo_urls.iter().enumerate() {
+                    bot.edit_message_text(
+                        chat_id,
+                        status_msg_id,
+                        format!(
+                            "Downloading photo {} from post {}/{}...",
+                            photo_index + 1,
+                            post_index + 1,
+                            media.posts.len()
+                        ),
+                    )
+                    .await
+                    .ok();
+                    let response = client
+                        .get(photo_url)
+                        .header(reqwest::header::REFERER, "https://www.instagram.com/")
+                        .send()
+                        .await
+                        .map_err(|e| format!("Cannot download Instagram photo: {e}"))?;
+                    let status = response.status();
+                    if !status.is_success() {
+                        return Err(format!("Instagram photo returned HTTP {status}"));
+                    }
+                    let bytes = response
+                        .bytes()
+                        .await
+                        .map_err(|e| format!("Cannot read Instagram photo: {e}"))?;
+                    let path = work_dir.join(format!(
+                        "photo-{post_index:05}-{shortcode}-{photo_index:02}.jpg"
+                    ));
+                    tokio::fs::write(&path, bytes)
+                        .await
+                        .map_err(|e| format!("Cannot save Instagram photo: {e}"))?;
+                    paths.push(path);
+                }
+
+                bot.edit_message_text(chat_id, status_msg_id, "Sending photos...")
+                    .await
+                    .ok();
+                for batch in paths.chunks(10) {
+                    send_instagram_photo_batch(bot, chat_id, batch, sent_photos, post_url).await?;
+                    sent_photos += batch.len();
+                }
+            }
+
+            if sent_photos == 0 {
+                return Err(last_error.unwrap_or_else(|| {
+                    "No downloadable photos were found on this Instagram profile".into()
+                }));
+            }
+            if failed_posts > 0 {
+                return Err(format!(
+                    "Profile photo download was incomplete: sent {sent_photos} photos, but {failed_posts} posts could not be processed ({})",
+                    last_error.unwrap_or_else(|| "unknown error".into())
+                ));
+            }
+        }
+
+        Ok(())
     }
     .await;
 
@@ -1267,13 +1576,21 @@ async fn handle_callback_query(
     let Some(data) = q.data.as_deref() else {
         return Ok(());
     };
-    let Some((kind, id)) = parse_youtube_download_callback(data) else {
+    let Some((kind, id)) = parse_download_callback(data) else {
         return Ok(());
+    };
+
+    let menu_name = if kind.is_youtube() {
+        "YouTube"
+    } else {
+        "Instagram profile"
     };
 
     let Some(message) = q.regular_message() else {
         bot.answer_callback_query(q.id)
-            .text("Cannot access this menu message. Send the YouTube link again.")
+            .text(format!(
+                "Cannot access this menu message. Send the {menu_name} link again."
+            ))
             .show_alert(true)
             .await?;
         return Ok(());
@@ -1287,13 +1604,21 @@ async fn handle_callback_query(
     };
     let Some(url) = url else {
         bot.answer_callback_query(q.id)
-            .text("This download menu expired. Send the YouTube link again.")
+            .text(format!(
+                "This download menu expired. Send the {menu_name} link again."
+            ))
             .show_alert(true)
             .await?;
         return Ok(());
     };
 
     bot.answer_callback_query(q.id.clone()).await?;
+    bot.edit_message_reply_markup(chat_id, status_msg_id)
+        .reply_markup(InlineKeyboardMarkup::new(
+            Vec::<Vec<InlineKeyboardButton>>::new(),
+        ))
+        .await
+        .ok();
 
     let result = {
         let _permit = acquire_download_permit(&queue, &bot, chat_id, status_msg_id).await;
@@ -1348,6 +1673,11 @@ async fn handle_message(
 
     if link.kind.is_youtube() {
         send_youtube_menu(&bot, msg.chat.id, link.url, &downloads).await?;
+        return Ok(());
+    }
+
+    if matches!(link.kind, DownloadKind::InstagramProfile) {
+        send_instagram_profile_menu(&bot, msg.chat.id, link.url, &downloads).await?;
         return Ok(());
     }
 
@@ -1682,18 +2012,19 @@ async fn fetch_metadata_field(url: &str, field: &str) -> Option<String> {
     }
 }
 
-const MAX_MEDIA_PREVIEW_SIZE: u64 = 49 * 1024 * 1024;
-const MAX_LOCAL_DOCUMENT_SIZE: u64 = 2_000_000_000;
+const MAX_CLOUD_UPLOAD_SIZE: u64 = 49 * 1024 * 1024;
+const MAX_LOCAL_UPLOAD_SIZE: u64 = 2_000_000_000;
+const MAX_VIDEO_THUMBNAIL_SIZE: u64 = 200_000;
 
 fn is_local_bot_api_url(api_url: &reqwest::Url) -> bool {
-    matches!(api_url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+    api_url.host_str() != Some("api.telegram.org")
 }
 
-fn telegram_document_limit(bot: &Bot) -> u64 {
+fn telegram_upload_limit(bot: &Bot) -> u64 {
     if is_local_bot_api_url(&bot.api_url()) {
-        MAX_LOCAL_DOCUMENT_SIZE
+        MAX_LOCAL_UPLOAD_SIZE
     } else {
-        MAX_MEDIA_PREVIEW_SIZE
+        MAX_CLOUD_UPLOAD_SIZE
     }
 }
 
@@ -1712,7 +2043,22 @@ async fn send_video_with_document_fallback(
     caption: &str,
 ) -> Result<(), teloxide::RequestError> {
     let video = InputFile::file(path).file_name(file_name.clone());
-    match bot.send_video(chat_id, video).caption(caption).await {
+    let thumbnail = generate_video_thumbnail(path).await;
+    let mut request = bot
+        .send_video(chat_id, video)
+        .caption(caption)
+        .supports_streaming(true);
+    if let Some(thumbnail) = thumbnail.as_ref() {
+        request = request
+            .thumbnail(InputFile::file(thumbnail))
+            .cover(InputFile::file(thumbnail));
+    }
+    let result = request.await;
+    if let Some(thumbnail) = thumbnail {
+        let _ = tokio::fs::remove_file(thumbnail).await;
+    }
+
+    match result {
         Ok(_) => Ok(()),
         Err(error) if is_request_entity_too_large(&error) => {
             log::info!("Telegram rejected video upload as too large; retrying as document");
@@ -1723,6 +2069,149 @@ async fn send_video_with_document_fallback(
                 .map(|_| ())
         }
         Err(error) => Err(error),
+    }
+}
+
+async fn probe_stream_codec(path: &Path, stream: &str) -> Result<Option<String>, String> {
+    let output = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            stream,
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ffprobe: {e}"))?;
+
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .last()
+            .unwrap_or("ffprobe exited with an error")
+            .to_string();
+        return Err(format!("Cannot inspect downloaded video: {details}"));
+    }
+
+    let codec = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!codec.is_empty()).then_some(codec))
+}
+
+async fn prepare_video_for_telegram(path: &Path) -> Result<PathBuf, String> {
+    let video_codec = probe_stream_codec(path, "v:0")
+        .await?
+        .ok_or_else(|| "Downloaded file has no video stream".to_string())?;
+    let audio_codec = probe_stream_codec(path, "a:0").await?;
+    let output = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("telegram-{}.mp4", Uuid::new_v4()));
+
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args(["-y", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-map", "0:a?", "-c:v"])
+        .arg(if video_codec == "h264" {
+            "copy"
+        } else {
+            "libx264"
+        });
+    if video_codec != "h264" {
+        cmd.args([
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+        ]);
+    }
+    if audio_codec.as_deref().is_some_and(|codec| codec != "aac") {
+        cmd.args(["-c:a", "aac", "-b:a", "128k"]);
+    } else {
+        cmd.args(["-c:a", "copy"]);
+    }
+    let result = cmd
+        .args(["-movflags", "+faststart"])
+        .arg(&output)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
+
+    if !result.status.success() {
+        let _ = tokio::fs::remove_file(&output).await;
+        let details = String::from_utf8_lossy(&result.stderr)
+            .lines()
+            .last()
+            .unwrap_or("ffmpeg exited with an error")
+            .to_string();
+        return Err(format!(
+            "Cannot prepare Telegram-compatible video: {details}"
+        ));
+    }
+
+    log::info!(
+        "Prepared MP4 for Telegram (video={video_codec}, audio={})",
+        audio_codec.as_deref().unwrap_or("none")
+    );
+    Ok(output)
+}
+
+async fn generate_video_thumbnail(path: &Path) -> Option<PathBuf> {
+    let thumbnail = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("telegram-preview-{}.jpg", Uuid::new_v4()));
+    let result = tokio::process::Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(path)
+        .args([
+            "-vf",
+            "thumbnail=30,scale=320:320:force_original_aspect_ratio=decrease",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-q:v",
+            "8",
+        ])
+        .arg(&thumbnail)
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let valid_size = tokio::fs::metadata(&thumbnail)
+                .await
+                .map(|metadata| metadata.len() < MAX_VIDEO_THUMBNAIL_SIZE)
+                .unwrap_or(false);
+            if valid_size {
+                Some(thumbnail)
+            } else {
+                log::warn!("Generated video thumbnail exceeds Telegram's 200 kB limit");
+                let _ = tokio::fs::remove_file(&thumbnail).await;
+                None
+            }
+        }
+        Ok(output) => {
+            let details = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("ffmpeg exited with an error")
+                .to_string();
+            log::warn!("Could not generate video thumbnail: {details}");
+            let _ = tokio::fs::remove_file(&thumbnail).await;
+            None
+        }
+        Err(error) => {
+            log::warn!("Could not run ffmpeg for video thumbnail: {error}");
+            None
+        }
     }
 }
 
@@ -1738,7 +2227,7 @@ async fn send_audio(
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
-    if metadata.len() <= MAX_MEDIA_PREVIEW_SIZE {
+    if metadata.len() <= MAX_CLOUD_UPLOAD_SIZE {
         let file = InputFile::file(path).file_name(format!("{title}.mp3"));
         let caption = media_caption(channel, url);
         let mut request = bot.send_audio(chat_id, file).title(title).caption(caption);
@@ -1751,8 +2240,8 @@ async fn send_audio(
         return Ok(());
     }
 
-    let document_limit = telegram_document_limit(bot);
-    if metadata.len() <= document_limit {
+    let upload_limit = telegram_upload_limit(bot);
+    if metadata.len() <= upload_limit {
         log::info!(
             "Sending oversized audio as document ({:.1}MB)",
             metadata.len() as f64 / 1024.0 / 1024.0
@@ -1767,7 +2256,7 @@ async fn send_audio(
         return Ok(());
     }
 
-    let chunks = split_media(path, "mp3", document_limit).await?;
+    let chunks = split_media(path, "mp3", upload_limit).await?;
     for (i, chunk) in chunks.iter().enumerate() {
         log::info!("Sending audio chunk {}/{}", i + 1, chunks.len());
         let label = if chunks.len() > 1 {
@@ -1804,32 +2293,37 @@ async fn send_video(
     title: &str,
     url: &str,
 ) -> Result<(), String> {
+    let prepared = prepare_video_for_telegram(path).await?;
+    let result = send_prepared_video(bot, chat_id, &prepared, title, url).await;
+    let _ = tokio::fs::remove_file(prepared).await;
+    result
+}
+
+async fn send_prepared_video(
+    bot: &Bot,
+    chat_id: ChatId,
+    path: &Path,
+    title: &str,
+    url: &str,
+) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
-        .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
+        .map_err(|e| format!("Cannot read prepared video: {e}"))?;
+    let upload_limit = telegram_upload_limit(bot);
 
-    if metadata.len() <= MAX_MEDIA_PREVIEW_SIZE {
-        send_video_with_document_fallback(bot, chat_id, path, format!("{title}.mp4"), url)
-            .await
-            .map_err(|e| format!("Telegram API error sending file: {e}"))?;
-        return Ok(());
-    }
-
-    let document_limit = telegram_document_limit(bot);
-    if metadata.len() <= document_limit {
+    if metadata.len() <= upload_limit {
         log::info!(
-            "Sending oversized video as document ({:.1}MB)",
+            "Sending streamable video with preview ({:.1}MB)",
             metadata.len() as f64 / 1024.0 / 1024.0
         );
-        let file = InputFile::file(path).file_name(format!("{title}.mp4"));
-        bot.send_document(chat_id, file)
-            .caption(url)
+        send_video_with_document_fallback(bot, chat_id, path, format!("{title}.mp4"), url)
             .await
-            .map_err(|error| format!("Telegram API error sending document: {error}"))?;
+            .map_err(|error| format!("Telegram API error sending video: {error}"))?;
         return Ok(());
     }
 
-    let chunks = split_media(path, "mp4", document_limit).await?;
+    let chunks = split_media(path, "mp4", upload_limit).await?;
+    let mut send_result = Ok(());
     for (i, chunk) in chunks.iter().enumerate() {
         log::info!("Sending video chunk {}/{}", i + 1, chunks.len());
         let label = if chunks.len() > 1 {
@@ -1837,17 +2331,22 @@ async fn send_video(
         } else {
             title.to_string()
         };
-        let file = InputFile::file(chunk).file_name(format!("{label}.mp4"));
-        bot.send_document(chat_id, file)
-            .caption(url)
-            .await
-            .map_err(|e| format!("Telegram API error on document chunk {}: {e}", i + 1))?;
+        if let Err(error) =
+            send_video_with_document_fallback(bot, chat_id, chunk, format!("{label}.mp4"), url)
+                .await
+        {
+            send_result = Err(format!(
+                "Telegram API error on video chunk {}: {error}",
+                i + 1
+            ));
+            break;
+        }
     }
     for chunk in &chunks {
         let _ = tokio::fs::remove_file(chunk).await;
     }
 
-    Ok(())
+    send_result
 }
 
 async fn split_media(path: &Path, ext: &str, max_size: u64) -> Result<Vec<PathBuf>, String> {
@@ -2203,6 +2702,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_instagram_profile_download_callback_choices() {
+        let (kind, id) = parse_download_callback("igpr:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::InstagramProfileReels));
+        assert_eq!(id, "abc123");
+
+        let (kind, id) = parse_download_callback("igpp:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::InstagramProfilePhotos));
+        assert_eq!(id, "abc123");
+
+        let (kind, id) = parse_download_callback("igpb:abc123").unwrap();
+        assert!(matches!(kind, DownloadKind::InstagramProfileBoth));
+        assert_eq!(id, "abc123");
+
+        assert!(parse_download_callback("igp:abc123").is_none());
+    }
+
+    #[test]
+    fn canonicalizes_instagram_profile_grid_links() {
+        assert_eq!(
+            InstagramProfilePage::Reels
+                .canonical_url("https://www.instagram.com/example/reel/REEL_123/?utm_source=test"),
+            Some((
+                "REEL_123".into(),
+                "https://www.instagram.com/reel/REEL_123/".into()
+            ))
+        );
+        assert_eq!(
+            InstagramProfilePage::Photos
+                .canonical_url("https://www.instagram.com/p/PHOTO_123/?img_index=2"),
+            Some((
+                "PHOTO_123".into(),
+                "https://www.instagram.com/p/PHOTO_123/".into()
+            ))
+        );
+        assert!(InstagramProfilePage::Photos
+            .canonical_url("https://www.instagram.com/reel/REEL_123/")
+            .is_none());
+    }
+
+    #[test]
     fn download_menu_store_expires_abandoned_menus() {
         let now = Instant::now();
         let mut downloads = HashMap::new();
@@ -2238,33 +2777,32 @@ mod tests {
 
     #[test]
     fn chunk_count_uses_ceiling_without_extra_exact_multiple() {
-        assert_eq!(chunk_count(0, MAX_MEDIA_PREVIEW_SIZE), 1);
-        assert_eq!(chunk_count(1, MAX_MEDIA_PREVIEW_SIZE), 1);
+        assert_eq!(chunk_count(0, MAX_CLOUD_UPLOAD_SIZE), 1);
+        assert_eq!(chunk_count(1, MAX_CLOUD_UPLOAD_SIZE), 1);
+        assert_eq!(chunk_count(MAX_CLOUD_UPLOAD_SIZE, MAX_CLOUD_UPLOAD_SIZE), 1);
         assert_eq!(
-            chunk_count(MAX_MEDIA_PREVIEW_SIZE, MAX_MEDIA_PREVIEW_SIZE),
-            1
-        );
-        assert_eq!(
-            chunk_count(MAX_MEDIA_PREVIEW_SIZE + 1, MAX_MEDIA_PREVIEW_SIZE),
+            chunk_count(MAX_CLOUD_UPLOAD_SIZE + 1, MAX_CLOUD_UPLOAD_SIZE),
             2
         );
         assert_eq!(
-            chunk_count(MAX_MEDIA_PREVIEW_SIZE * 2, MAX_MEDIA_PREVIEW_SIZE),
+            chunk_count(MAX_CLOUD_UPLOAD_SIZE * 2, MAX_CLOUD_UPLOAD_SIZE),
             2
         );
     }
 
     #[test]
-    fn local_bot_api_uses_two_gigabyte_document_limit() {
+    fn local_bot_api_uses_two_gigabyte_upload_limit() {
         let local = reqwest::Url::parse("http://127.0.0.1:8081").unwrap();
+        let docker = reqwest::Url::parse("http://telegram-bot-api:8081").unwrap();
         let cloud = reqwest::Url::parse("https://api.telegram.org").unwrap();
         let local_bot = Bot::new("test-token").set_api_url(local.clone());
         let cloud_bot = Bot::new("test-token").set_api_url(cloud.clone());
 
         assert!(is_local_bot_api_url(&local));
+        assert!(is_local_bot_api_url(&docker));
         assert!(!is_local_bot_api_url(&cloud));
-        assert_eq!(telegram_document_limit(&local_bot), 2_000_000_000);
-        assert_eq!(telegram_document_limit(&cloud_bot), MAX_MEDIA_PREVIEW_SIZE);
+        assert_eq!(telegram_upload_limit(&local_bot), 2_000_000_000);
+        assert_eq!(telegram_upload_limit(&cloud_bot), MAX_CLOUD_UPLOAD_SIZE);
     }
 
     #[test]

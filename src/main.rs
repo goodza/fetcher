@@ -22,6 +22,8 @@ const DOWNLOAD_MENU_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_DOWNLOAD_MENUS: usize = 1_024;
 const NO_INSTAGRAM_PROFILE_PHOTO_POSTS: &str =
     "No photo posts were found on this Instagram profile";
+const NO_INSTAGRAM_POST_PHOTOS: &str = "No photos were found in this Instagram post; it may be unavailable, private, video-only, or require fresh cookies";
+const EMPTY_INSTAGRAM_PROFILE: &str = "This Instagram profile has no downloadable Reels or photos";
 
 struct DownloadQueueState {
     semaphore: Arc<Semaphore>,
@@ -340,6 +342,10 @@ fn parse_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
 fn should_restore_instagram_profile_menu(kind: DownloadKind, error: &str) -> bool {
     matches!(kind, DownloadKind::InstagramProfilePhotos)
         && error == NO_INSTAGRAM_PROFILE_PHOTO_POSTS
+}
+
+fn should_show_empty_instagram_profile(kind: DownloadKind, error: &str) -> bool {
+    matches!(kind, DownloadKind::InstagramProfileBoth) && error == EMPTY_INSTAGRAM_PROFILE
 }
 
 fn register_waiting_download(queue: &DownloadQueue) -> (usize, WaitingDownload) {
@@ -944,7 +950,7 @@ async fn fetch_instagram_post_photo_urls(
         .map_err(|e| format!("Cannot read Instagram post: {e}"))?;
     let photos = extract_instagram_post_photo_urls(&html, shortcode);
     if photos.is_empty() {
-        return Err("No photos were found in this Instagram post; it may be unavailable, private, video-only, or require fresh cookies".into());
+        return Err(NO_INSTAGRAM_POST_PHOTOS.into());
     }
 
     Ok((shortcode.to_string(), photos))
@@ -1467,7 +1473,7 @@ async fn download_instagram_profile_and_send(
             return Err(NO_INSTAGRAM_PROFILE_PHOTO_POSTS.into());
         }
         if media.reels.is_empty() && media.posts.is_empty() {
-            return Err("No Reels or photo posts were found on this Instagram profile".into());
+            return Err(EMPTY_INSTAGRAM_PROFILE.into());
         }
 
         if include_reels && !media.reels.is_empty() {
@@ -1536,6 +1542,10 @@ async fn download_instagram_profile_and_send(
                 let (shortcode, photo_urls) =
                     match fetch_instagram_post_photo_urls(&client, post_url).await {
                         Ok(post) => post,
+                        Err(error) if error == NO_INSTAGRAM_POST_PHOTOS => {
+                            log::info!("Instagram profile post {post_url} contains no photos");
+                            continue;
+                        }
                         Err(error) => {
                             log::warn!("Skipping Instagram profile post {post_url}: {error}");
                             last_error = Some(error);
@@ -1591,9 +1601,16 @@ async fn download_instagram_profile_and_send(
             }
 
             if sent_photos == 0 {
-                return Err(last_error.unwrap_or_else(|| {
-                    "No downloadable photos were found on this Instagram profile".into()
-                }));
+                if let Some(error) = last_error {
+                    return Err(error);
+                }
+                if downloading_both {
+                    if media.reels.is_empty() {
+                        return Err(EMPTY_INSTAGRAM_PROFILE.into());
+                    }
+                } else {
+                    return Err(NO_INSTAGRAM_PROFILE_PHOTO_POSTS.into());
+                }
             }
             if failed_posts > 0 {
                 return Err(format!(
@@ -1679,6 +1696,15 @@ async fn handle_callback_query(
     if let Err(e) = result {
         if should_restore_instagram_profile_menu(kind, &e) {
             restore_instagram_profile_menu(&bot, chat_id, status_msg_id, &url, &downloads).await?;
+            return Ok(());
+        }
+        if should_show_empty_instagram_profile(kind, &e) {
+            bot.edit_message_text(
+                chat_id,
+                status_msg_id,
+                format!("{EMPTY_INSTAGRAM_PROFILE}."),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -2780,6 +2806,15 @@ mod tests {
         assert!(!should_restore_instagram_profile_menu(
             DownloadKind::InstagramProfilePhotos,
             "Another error"
+        ));
+
+        assert!(should_show_empty_instagram_profile(
+            DownloadKind::InstagramProfileBoth,
+            EMPTY_INSTAGRAM_PROFILE
+        ));
+        assert!(!should_show_empty_instagram_profile(
+            DownloadKind::InstagramProfilePhotos,
+            EMPTY_INSTAGRAM_PROFILE
         ));
     }
 

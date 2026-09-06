@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 const DOWNLOAD_MENU_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_DOWNLOAD_MENUS: usize = 1_024;
+const REEL_TRANSITION_SECONDS: f64 = 0.5;
 const NO_INSTAGRAM_PROFILE_PHOTO_POSTS: &str =
     "No photo posts were found on this Instagram profile";
 const NO_INSTAGRAM_POST_PHOTOS: &str = "No photos were found in this Instagram post; it may be unavailable, private, video-only, or require fresh cookies";
@@ -1396,6 +1397,138 @@ async fn gather_instagram_profile_media_urls(
     result
 }
 
+#[derive(Debug)]
+struct ReelMediaInfo {
+    duration: f64,
+    width: u64,
+    height: u64,
+    has_audio: bool,
+}
+
+fn json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
+}
+
+async fn probe_reel_media(path: &Path) -> Result<ReelMediaInfo, String> {
+    let output = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=codec_type,width,height,duration",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to inspect downloaded Reel: {e}"))?;
+
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("Cannot inspect downloaded Reel: {details}"));
+    }
+
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Cannot read downloaded Reel metadata: {e}"))?;
+    let streams = metadata["streams"]
+        .as_array()
+        .ok_or_else(|| "Downloaded Reel metadata has no streams".to_string())?;
+    let video = streams
+        .iter()
+        .find(|stream| stream["codec_type"].as_str() == Some("video"))
+        .ok_or_else(|| "Downloaded Reel has no video stream".to_string())?;
+    let duration = json_f64(metadata["format"].get("duration"))
+        .or_else(|| json_f64(video.get("duration")))
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| "Cannot determine downloaded Reel duration".to_string())?;
+    let width = video["width"]
+        .as_u64()
+        .filter(|width| *width > 0)
+        .ok_or_else(|| "Cannot determine downloaded Reel width".to_string())?;
+    let height = video["height"]
+        .as_u64()
+        .filter(|height| *height > 0)
+        .ok_or_else(|| "Cannot determine downloaded Reel height".to_string())?;
+
+    Ok(ReelMediaInfo {
+        duration,
+        width,
+        height,
+        has_audio: streams
+            .iter()
+            .any(|stream| stream["codec_type"].as_str() == Some("audio")),
+    })
+}
+
+fn reel_transition_filter(media: &[ReelMediaInfo]) -> Result<String, String> {
+    let first = media
+        .first()
+        .ok_or_else(|| "No downloaded Reels to concatenate".to_string())?;
+    let width = first.width - first.width % 2;
+    let height = first.height - first.height % 2;
+    if width == 0 || height == 0 {
+        return Err("Downloaded Reel has invalid dimensions".into());
+    }
+
+    let shortest = media
+        .iter()
+        .map(|item| item.duration)
+        .fold(f64::INFINITY, f64::min);
+    let transition = REEL_TRANSITION_SECONDS.min(shortest / 2.0);
+    let mut filters = Vec::with_capacity(media.len() * 4);
+
+    for (index, item) in media.iter().enumerate() {
+        filters.push(format!(
+            "[{index}:v:0]settb=AVTB,setpts=PTS-STARTPTS,fps=30,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[v{index}]"
+        ));
+        if item.has_audio {
+            filters.push(format!(
+                "[{index}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={:.6},asetpts=PTS-STARTPTS[a{index}]",
+                item.duration
+            ));
+        } else {
+            filters.push(format!(
+                "anullsrc=r=48000:cl=stereo:d={:.6},asetpts=PTS-STARTPTS[a{index}]",
+                item.duration
+            ));
+        }
+    }
+
+    let mut video_label = "v0".to_string();
+    let mut audio_label = "a0".to_string();
+    let mut elapsed = first.duration;
+    for index in 1..media.len() {
+        let last = index + 1 == media.len();
+        let next_video = if last {
+            "vout".to_string()
+        } else {
+            format!("vx{index}")
+        };
+        let next_audio = if last {
+            "aout".to_string()
+        } else {
+            format!("ax{index}")
+        };
+        let offset = elapsed - transition;
+        filters.push(format!(
+            "[{video_label}][v{index}]xfade=transition=circleopen:duration={transition:.6}:offset={offset:.6}[{next_video}]"
+        ));
+        filters.push(format!(
+            "[{audio_label}][a{index}]acrossfade=d={transition:.6}:c1=tri:c2=tri[{next_audio}]"
+        ));
+        video_label = next_video;
+        audio_label = next_audio;
+        elapsed += media[index].duration - transition;
+    }
+
+    Ok(filters.join(";"))
+}
+
 async fn concatenate_videos(inputs: &[PathBuf], output: &Path) -> Result<(), String> {
     if inputs.len() == 1 {
         tokio::fs::copy(&inputs[0], output)
@@ -1404,25 +1537,43 @@ async fn concatenate_videos(inputs: &[PathBuf], output: &Path) -> Result<(), Str
         return Ok(());
     }
 
-    let list_path = output.with_extension("txt");
-    let list = inputs
-        .iter()
-        .map(|path| format!("file '{}'\n", path.display()))
-        .collect::<String>();
-    tokio::fs::write(&list_path, list)
-        .await
-        .map_err(|e| format!("Cannot create ffmpeg concat list: {e}"))?;
+    let mut media = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        media.push(probe_reel_media(input).await?);
+    }
+    let filter = reel_transition_filter(&media)?;
 
-    let result = tokio::process::Command::new("ffmpeg")
-        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
-        .arg(&list_path)
-        .args(["-c", "copy", "-movflags", "+faststart"])
+    let mut command = tokio::process::Command::new("ffmpeg");
+    command.arg("-y");
+    for input in inputs {
+        command.arg("-i").arg(input);
+    }
+    let result = command
+        .arg("-filter_complex")
+        .arg(filter)
+        .args([
+            "-map",
+            "[vout]",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            "-shortest",
+        ])
         .arg(output)
         .output()
         .await
-        .map_err(|e| format!("Failed to run ffmpeg: {e}"));
-    let _ = tokio::fs::remove_file(&list_path).await;
-    let result = result?;
+        .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
 
     if !result.status.success() {
         let details = String::from_utf8_lossy(&result.stderr)
@@ -1430,7 +1581,7 @@ async fn concatenate_videos(inputs: &[PathBuf], output: &Path) -> Result<(), Str
             .last()
             .unwrap_or("ffmpeg exited with an error")
             .to_string();
-        return Err(format!("ffmpeg concat failed: {details}"));
+        return Err(format!("ffmpeg Reel transition failed: {details}"));
     }
 
     Ok(())
@@ -1504,7 +1655,7 @@ async fn download_instagram_profile_and_send(
             bot.edit_message_text(
                 chat_id,
                 status_msg_id,
-                format!("Concatenating {} Reels...", videos.len()),
+                format!("Adding circle transitions to {} Reels...", videos.len()),
             )
             .await
             .ok();
@@ -2728,6 +2879,37 @@ mod tests {
             format!("Example channel\n{url}")
         );
         assert_eq!(media_caption(Some("  "), url), url);
+    }
+
+    #[test]
+    fn builds_circleopen_reel_transitions_with_matching_audio_fades() {
+        let filter = reel_transition_filter(&[
+            ReelMediaInfo {
+                duration: 10.0,
+                width: 1080,
+                height: 1920,
+                has_audio: true,
+            },
+            ReelMediaInfo {
+                duration: 6.0,
+                width: 720,
+                height: 1280,
+                has_audio: false,
+            },
+            ReelMediaInfo {
+                duration: 8.0,
+                width: 1080,
+                height: 1920,
+                has_audio: true,
+            },
+        ])
+        .unwrap();
+
+        assert!(filter.contains("xfade=transition=circleopen:duration=0.500000:offset=9.500000"));
+        assert!(filter.contains("xfade=transition=circleopen:duration=0.500000:offset=15.000000"));
+        assert!(filter.contains("anullsrc=r=48000:cl=stereo:d=6.000000"));
+        assert!(filter.contains("acrossfade=d=0.500000:c1=tri:c2=tri[aout]"));
+        assert!(filter.contains("scale=1080:1920"));
     }
 
     #[test]

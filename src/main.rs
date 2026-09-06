@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 const DOWNLOAD_MENU_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_DOWNLOAD_MENUS: usize = 1_024;
+const NO_INSTAGRAM_PROFILE_PHOTO_POSTS: &str =
+    "No photo posts were found on this Instagram profile";
 
 struct DownloadQueueState {
     semaphore: Arc<Semaphore>,
@@ -335,6 +337,11 @@ fn parse_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
         .or_else(|| parse_instagram_profile_download_callback(data))
 }
 
+fn should_restore_instagram_profile_menu(kind: DownloadKind, error: &str) -> bool {
+    matches!(kind, DownloadKind::InstagramProfilePhotos)
+        && error == NO_INSTAGRAM_PROFILE_PHOTO_POSTS
+}
+
 fn register_waiting_download(queue: &DownloadQueue) -> (usize, WaitingDownload) {
     let position = queue.waiting.fetch_add(1, Ordering::SeqCst) + 1;
     (
@@ -550,13 +557,7 @@ async fn send_instagram_profile_menu(
         insert_download_menu(&mut downloads, id.clone(), url.to_string(), Instant::now());
     }
 
-    let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("All reels", format!("igpr:{id}")),
-            InlineKeyboardButton::callback("All photos", format!("igpp:{id}")),
-        ],
-        vec![InlineKeyboardButton::callback("Both", format!("igpb:{id}"))],
-    ]);
+    let keyboard = instagram_profile_menu_keyboard(&id);
 
     let result = bot
         .send_message(
@@ -564,6 +565,49 @@ async fn send_instagram_profile_menu(
             "What would you like to download from this profile?",
         )
         .reply_markup(keyboard)
+        .await;
+
+    if result.is_err() {
+        let mut downloads = downloads.lock().expect("download store lock poisoned");
+        downloads.remove(&id);
+    }
+    result?;
+
+    Ok(())
+}
+
+fn instagram_profile_menu_keyboard(id: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("All reels", format!("igpr:{id}")),
+            InlineKeyboardButton::callback("All photos", format!("igpp:{id}")),
+        ],
+        vec![InlineKeyboardButton::callback("Both", format!("igpb:{id}"))],
+    ])
+}
+
+async fn restore_instagram_profile_menu(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    url: &str,
+    downloads: &DownloadStore,
+) -> ResponseResult<()> {
+    let id = Uuid::new_v4().to_string();
+    {
+        let mut downloads = downloads.lock().expect("download store lock poisoned");
+        insert_download_menu(&mut downloads, id.clone(), url.to_string(), Instant::now());
+    }
+
+    let result = bot
+        .edit_message_text(
+            chat_id,
+            message_id,
+            format!(
+                "{NO_INSTAGRAM_PROFILE_PHOTO_POSTS}.\n\nWhat would you like to download instead?"
+            ),
+        )
+        .reply_markup(instagram_profile_menu_keyboard(&id))
         .await;
 
     if result.is_err() {
@@ -1420,7 +1464,7 @@ async fn download_instagram_profile_and_send(
             return Err("No Reels were found on this Instagram profile".into());
         }
         if include_photos && media.posts.is_empty() && !downloading_both {
-            return Err("No photo posts were found on this Instagram profile".into());
+            return Err(NO_INSTAGRAM_PROFILE_PHOTO_POSTS.into());
         }
         if media.reels.is_empty() && media.posts.is_empty() {
             return Err("No Reels or photo posts were found on this Instagram profile".into());
@@ -1633,6 +1677,11 @@ async fn handle_callback_query(
     };
 
     if let Err(e) = result {
+        if should_restore_instagram_profile_menu(kind, &e) {
+            restore_instagram_profile_menu(&bot, chat_id, status_msg_id, &url, &downloads).await?;
+            return Ok(());
+        }
+
         notify_error(&format!(
             "ERROR fetcher {} download failed: {e} ({url})",
             kind.log_kind()
@@ -2716,6 +2765,22 @@ mod tests {
         assert_eq!(id, "abc123");
 
         assert!(parse_download_callback("igp:abc123").is_none());
+    }
+
+    #[test]
+    fn restores_profile_menu_when_all_photos_finds_no_posts() {
+        assert!(should_restore_instagram_profile_menu(
+            DownloadKind::InstagramProfilePhotos,
+            NO_INSTAGRAM_PROFILE_PHOTO_POSTS
+        ));
+        assert!(!should_restore_instagram_profile_menu(
+            DownloadKind::InstagramProfileReels,
+            NO_INSTAGRAM_PROFILE_PHOTO_POSTS
+        ));
+        assert!(!should_restore_instagram_profile_menu(
+            DownloadKind::InstagramProfilePhotos,
+            "Another error"
+        ));
     }
 
     #[test]

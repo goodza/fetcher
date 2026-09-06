@@ -1,0 +1,134 @@
+name: Deploy to gsweb
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-gsweb
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SSH_HOST: ${{ secrets.GSWEB_HOST }}
+      SSH_USER: ${{ secrets.GSWEB_USER }}
+      SSH_PORT: ${{ secrets.GSWEB_SSH_PORT }}
+      REMOTE_DIR: /home/edzlf/fetcher
+      PM2_APP: fetcher
+      MAX_CONCURRENT_DOWNLOADS: "2"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.GSWEB_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.GSWEB_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${SSH_HOST:?Set the GSWEB_HOST repository secret}"
+          : "${SSH_USER:?Set the GSWEB_USER repository secret}"
+          : "${SSH_PRIVATE_KEY:?Set the GSWEB_SSH_PRIVATE_KEY repository secret}"
+          : "${SSH_KNOWN_HOSTS:?Set the GSWEB_KNOWN_HOSTS repository secret}"
+          echo "SSH_PORT=${SSH_PORT:-22}" >> "$GITHUB_ENV"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+
+      - name: Upload and deploy
+        run: |
+          set -euo pipefail
+          ssh_args=(
+            -i "$HOME/.ssh/id_ed25519"
+            -p "$SSH_PORT"
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+          )
+          scp_args=(
+            -i "$HOME/.ssh/id_ed25519"
+            -P "$SSH_PORT"
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+          )
+          destination="${SSH_USER}@${SSH_HOST}"
+          remote_new="${REMOTE_DIR}/fetcher.new-${GITHUB_SHA}"
+          local_sha=$(sha256sum target/release/fetcher | cut -d' ' -f1)
+
+          ssh "${ssh_args[@]}" "$destination" "mkdir -p '${REMOTE_DIR}'"
+          scp "${scp_args[@]}" target/release/fetcher "${destination}:${remote_new}"
+          remote_sha=$(
+            ssh "${ssh_args[@]}" "$destination" \
+              "sha256sum '${remote_new}' | cut -d' ' -f1"
+          )
+          if [[ "$local_sha" != "$remote_sha" ]]; then
+            ssh "${ssh_args[@]}" "$destination" "rm -f '${remote_new}'"
+            echo "Uploaded binary checksum mismatch" >&2
+            exit 1
+          fi
+
+          ssh "${ssh_args[@]}" "$destination" bash -s -- \
+            "$REMOTE_DIR" "$PM2_APP" "$remote_new" "$MAX_CONCURRENT_DOWNLOADS" <<'REMOTE'
+          set -euo pipefail
+          remote_dir=$1
+          app=$2
+          remote_new=$3
+          max_downloads=$4
+          binary="${remote_dir}/fetcher"
+          previous="${remote_dir}/fetcher.previous"
+
+          test -s "$remote_new"
+          chmod 700 "$remote_dir" "$remote_new"
+          if [[ -f "$binary" ]]; then
+            cp -p "$binary" "$previous"
+          fi
+          mv "$remote_new" "$binary"
+          chmod 700 "$binary"
+          cd "$remote_dir"
+          export MAX_CONCURRENT_DOWNLOADS="$max_downloads"
+
+          restart() {
+            if pm2 describe "$app" >/dev/null 2>&1; then
+              pm2 restart "$app" --update-env >/dev/null
+            else
+              pm2 start "./fetcher" --name "$app" --cwd "$remote_dir" >/dev/null
+            fi
+          }
+
+          if ! restart; then
+            if [[ -f "$previous" ]]; then
+              mv "$previous" "$binary"
+              restart || true
+            fi
+            echo "PM2 failed to restart the new binary" >&2
+            exit 1
+          fi
+
+          sleep 3
+          if [[ $(pm2 pid "$app") == "0" ]]; then
+            if [[ -f "$previous" ]]; then
+              mv "$previous" "$binary"
+              restart || true
+            fi
+            echo "The new process did not stay online; restored the previous binary" >&2
+            exit 1
+          fi
+
+          pm2 save >/dev/null
+          pm2 describe "$app" | grep -E 'status|script path|exec cwd|restarts|unstable restarts'
+          REMOTE

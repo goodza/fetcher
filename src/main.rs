@@ -75,12 +75,21 @@ async fn main() {
         std::env::var("MAX_CONCURRENT_DOWNLOADS").expect("MAX_CONCURRENT_DOWNLOADS must be set");
     let max_concurrent_downloads = parse_max_concurrent_downloads(&max_concurrent_downloads)
         .expect("MAX_CONCURRENT_DOWNLOADS must be a positive integer");
+    let api_url = std::env::var("TELOXIDE_API_URL")
+        .unwrap_or_else(|_| "https://api.telegram.org".to_string());
+    let api_url = reqwest::Url::parse(&api_url).expect("TELOXIDE_API_URL must be a valid URL");
+    let request_timeout = if is_local_bot_api_url(&api_url) {
+        Duration::from_secs(30 * 60)
+    } else {
+        Duration::from_secs(120)
+    };
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(request_timeout)
         .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("Failed to build HTTP client");
-    let bot = Bot::with_client(token, client);
+    log::info!("Using Telegram Bot API at {api_url}");
+    let bot = Bot::with_client(token, client).set_api_url(api_url);
     let queue = new_download_queue(max_concurrent_downloads);
     let downloads: DownloadStore = Arc::new(Mutex::new(HashMap::new()));
     let handler = dptree::entry()
@@ -140,18 +149,6 @@ impl DownloadKind {
                 | Self::YouTubeVideo1440
                 | Self::YouTubeVideo2160
                 | Self::YouTubeAudio
-        )
-    }
-
-    fn is_youtube_video(self) -> bool {
-        matches!(
-            self,
-            Self::YouTubeVideo
-                | Self::YouTubeVideo480
-                | Self::YouTubeVideo720
-                | Self::YouTubeVideo1024
-                | Self::YouTubeVideo1440
-                | Self::YouTubeVideo2160
         )
     }
 
@@ -631,7 +628,7 @@ async fn download_and_send_media(
             .ok();
 
         if kind.is_inline_video() {
-            send_video(bot, chat_id, &tmp_path, &title, kind).await
+            send_video(bot, chat_id, &tmp_path, &title).await
         } else {
             send_audio(bot, chat_id, &tmp_path, &title, channel.as_deref()).await
         }
@@ -1326,14 +1323,7 @@ async fn download_instagram_profile_and_send(
         bot.edit_message_text(chat_id, status_msg_id, "Sending video...")
             .await
             .ok();
-        send_video(
-            bot,
-            chat_id,
-            &output,
-            &format!("{username} reels"),
-            DownloadKind::InstagramProfile,
-        )
-        .await
+        send_video(bot, chat_id, &output, &format!("{username} reels")).await
     }
     .await;
 
@@ -1765,7 +1755,20 @@ async fn fetch_metadata_field(url: &str, field: &str) -> Option<String> {
     }
 }
 
-const MAX_TG_SIZE: u64 = 49 * 1024 * 1024;
+const MAX_MEDIA_PREVIEW_SIZE: u64 = 49 * 1024 * 1024;
+const MAX_LOCAL_DOCUMENT_SIZE: u64 = 2_000_000_000;
+
+fn is_local_bot_api_url(api_url: &reqwest::Url) -> bool {
+    matches!(api_url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+}
+
+fn telegram_document_limit(bot: &Bot) -> u64 {
+    if is_local_bot_api_url(&bot.api_url()) {
+        MAX_LOCAL_DOCUMENT_SIZE
+    } else {
+        MAX_MEDIA_PREVIEW_SIZE
+    }
+}
 
 fn is_request_entity_too_large(error: &teloxide::RequestError) -> bool {
     matches!(
@@ -1803,7 +1806,7 @@ async fn send_audio(
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
-    if metadata.len() <= MAX_TG_SIZE {
+    if metadata.len() <= MAX_MEDIA_PREVIEW_SIZE {
         let file = InputFile::file(path).file_name(format!("{title}.mp3"));
         let mut request = bot.send_audio(chat_id, file).title(title);
         if let Some(channel) = channel {
@@ -1815,7 +1818,24 @@ async fn send_audio(
         return Ok(());
     }
 
-    let chunks = split_media(path, "mp3").await?;
+    let document_limit = telegram_document_limit(bot);
+    if metadata.len() <= document_limit {
+        log::info!(
+            "Sending oversized audio as document ({:.1}MB)",
+            metadata.len() as f64 / 1024.0 / 1024.0
+        );
+        let file = InputFile::file(path).file_name(format!("{title}.mp3"));
+        let mut request = bot.send_document(chat_id, file);
+        if let Some(channel) = channel {
+            request = request.caption(channel);
+        }
+        request
+            .await
+            .map_err(|e| format!("Telegram API error sending document: {e}"))?;
+        return Ok(());
+    }
+
+    let chunks = split_media(path, "mp3", document_limit).await?;
     for (i, chunk) in chunks.iter().enumerate() {
         log::info!("Sending audio chunk {}/{}", i + 1, chunks.len());
         let label = if chunks.len() > 1 {
@@ -1824,13 +1844,13 @@ async fn send_audio(
             title.to_string()
         };
         let file = InputFile::file(chunk).file_name(format!("{label}.mp3"));
-        let mut request = bot.send_audio(chat_id, file).title(label);
+        let mut request = bot.send_document(chat_id, file);
         if let Some(channel) = channel {
-            request = request.performer(channel).caption(channel);
+            request = request.caption(channel);
         }
         request
             .await
-            .map_err(|e| format!("Telegram API error on chunk {}: {e}", i + 1))?;
+            .map_err(|e| format!("Telegram API error on document chunk {}: {e}", i + 1))?;
     }
     for chunk in &chunks {
         let _ = tokio::fs::remove_file(chunk).await;
@@ -1839,42 +1859,32 @@ async fn send_audio(
     Ok(())
 }
 
-async fn send_video(
-    bot: &Bot,
-    chat_id: ChatId,
-    path: &Path,
-    title: &str,
-    kind: DownloadKind,
-) -> Result<(), String> {
+async fn send_video(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
-    if metadata.len() <= MAX_TG_SIZE {
+    if metadata.len() <= MAX_MEDIA_PREVIEW_SIZE {
         send_video_with_document_fallback(bot, chat_id, path, format!("{title}.mp4"))
             .await
             .map_err(|e| format!("Telegram API error sending file: {e}"))?;
         return Ok(());
     }
 
-    if kind.is_youtube_video() {
+    let document_limit = telegram_document_limit(bot);
+    if metadata.len() <= document_limit {
         log::info!(
-            "Sending oversized YouTube video as document ({:.1}MB)",
+            "Sending oversized video as document ({:.1}MB)",
             metadata.len() as f64 / 1024.0 / 1024.0
         );
         let file = InputFile::file(path).file_name(format!("{title}.mp4"));
-        match bot.send_document(chat_id, file).await {
-            Ok(_) => return Ok(()),
-            Err(error) if is_request_entity_too_large(&error) => {
-                log::info!(
-                    "Telegram rejected document upload as too large; splitting into smaller parts"
-                );
-            }
-            Err(error) => return Err(format!("Telegram API error sending file: {error}")),
-        }
+        bot.send_document(chat_id, file)
+            .await
+            .map_err(|error| format!("Telegram API error sending document: {error}"))?;
+        return Ok(());
     }
 
-    let chunks = split_media(path, "mp4").await?;
+    let chunks = split_media(path, "mp4", document_limit).await?;
     for (i, chunk) in chunks.iter().enumerate() {
         log::info!("Sending video chunk {}/{}", i + 1, chunks.len());
         let label = if chunks.len() > 1 {
@@ -1882,9 +1892,10 @@ async fn send_video(
         } else {
             title.to_string()
         };
-        send_video_with_document_fallback(bot, chat_id, chunk, format!("{label}.mp4"))
+        let file = InputFile::file(chunk).file_name(format!("{label}.mp4"));
+        bot.send_document(chat_id, file)
             .await
-            .map_err(|e| format!("Telegram API error on chunk {}: {e}", i + 1))?;
+            .map_err(|e| format!("Telegram API error on document chunk {}: {e}", i + 1))?;
     }
     for chunk in &chunks {
         let _ = tokio::fs::remove_file(chunk).await;
@@ -1893,13 +1904,13 @@ async fn send_video(
     Ok(())
 }
 
-async fn split_media(path: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
+async fn split_media(path: &Path, ext: &str, max_size: u64) -> Result<Vec<PathBuf>, String> {
     let file_size = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read file: {e}"))?
         .len();
 
-    let num_chunks = chunk_count(file_size, MAX_TG_SIZE);
+    let num_chunks = chunk_count(file_size, max_size);
 
     // Get total duration via ffprobe
     let probe = tokio::process::Command::new("ffprobe")
@@ -1971,7 +1982,7 @@ async fn split_media(path: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
         return Err("No chunks produced by ffmpeg".into());
     }
 
-    if let Err(e) = validate_chunk_sizes(&chunks).await {
+    if let Err(e) = validate_chunk_sizes(&chunks, max_size).await {
         for chunk in &chunks {
             let _ = tokio::fs::remove_file(chunk).await;
         }
@@ -1985,14 +1996,14 @@ fn chunk_count(file_size: u64, max_size: u64) -> u64 {
     file_size.div_ceil(max_size).max(1)
 }
 
-async fn validate_chunk_sizes(chunks: &[PathBuf]) -> Result<(), String> {
+async fn validate_chunk_sizes(chunks: &[PathBuf], max_size: u64) -> Result<(), String> {
     for chunk in chunks {
         let size = tokio::fs::metadata(chunk)
             .await
             .map_err(|e| format!("Cannot read split chunk {}: {e}", chunk.display()))?
             .len();
 
-        if size > MAX_TG_SIZE {
+        if size > max_size {
             return Err(format!(
                 "Split chunk {} is too large ({:.1}MB)",
                 chunk.display(),
@@ -2292,11 +2303,33 @@ mod tests {
 
     #[test]
     fn chunk_count_uses_ceiling_without_extra_exact_multiple() {
-        assert_eq!(chunk_count(0, MAX_TG_SIZE), 1);
-        assert_eq!(chunk_count(1, MAX_TG_SIZE), 1);
-        assert_eq!(chunk_count(MAX_TG_SIZE, MAX_TG_SIZE), 1);
-        assert_eq!(chunk_count(MAX_TG_SIZE + 1, MAX_TG_SIZE), 2);
-        assert_eq!(chunk_count(MAX_TG_SIZE * 2, MAX_TG_SIZE), 2);
+        assert_eq!(chunk_count(0, MAX_MEDIA_PREVIEW_SIZE), 1);
+        assert_eq!(chunk_count(1, MAX_MEDIA_PREVIEW_SIZE), 1);
+        assert_eq!(
+            chunk_count(MAX_MEDIA_PREVIEW_SIZE, MAX_MEDIA_PREVIEW_SIZE),
+            1
+        );
+        assert_eq!(
+            chunk_count(MAX_MEDIA_PREVIEW_SIZE + 1, MAX_MEDIA_PREVIEW_SIZE),
+            2
+        );
+        assert_eq!(
+            chunk_count(MAX_MEDIA_PREVIEW_SIZE * 2, MAX_MEDIA_PREVIEW_SIZE),
+            2
+        );
+    }
+
+    #[test]
+    fn local_bot_api_uses_two_gigabyte_document_limit() {
+        let local = reqwest::Url::parse("http://127.0.0.1:8081").unwrap();
+        let cloud = reqwest::Url::parse("https://api.telegram.org").unwrap();
+        let local_bot = Bot::new("test-token").set_api_url(local.clone());
+        let cloud_bot = Bot::new("test-token").set_api_url(cloud.clone());
+
+        assert!(is_local_bot_api_url(&local));
+        assert!(!is_local_bot_api_url(&cloud));
+        assert_eq!(telegram_document_limit(&local_bot), 2_000_000_000);
+        assert_eq!(telegram_document_limit(&cloud_bot), MAX_MEDIA_PREVIEW_SIZE);
     }
 
     #[test]

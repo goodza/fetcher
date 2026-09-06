@@ -72,6 +72,7 @@ jobs:
 
           ssh "${ssh_args[@]}" "$destination" "mkdir -p '${REMOTE_DIR}'"
           scp "${scp_args[@]}" target/release/fetcher "${destination}:${remote_new}"
+          scp "${scp_args[@]}" compose.yaml "${destination}:${REMOTE_DIR}/compose.yaml"
           remote_sha=$(
             ssh "${ssh_args[@]}" "$destination" \
               "sha256sum '${remote_new}' | cut -d' ' -f1"
@@ -94,6 +95,33 @@ jobs:
 
           test -s "$remote_new"
           chmod 700 "$remote_dir" "$remote_new"
+          chmod 600 "$remote_dir/compose.yaml"
+          test -f "$remote_dir/.env"
+          docker compose --project-directory "$remote_dir" -f "$remote_dir/compose.yaml" \
+            up -d --wait telegram-bot-api
+          migration_marker="$remote_dir/.telegram-local-api-migrated"
+          if [[ ! -f "$migration_marker" ]]; then
+            if pm2 describe "$app" >/dev/null 2>&1; then
+              pm2 stop "$app" >/dev/null || true
+            fi
+            set -a
+            source "$remote_dir/.env"
+            set +a
+            : "${TG_TOKEN:?TG_TOKEN must be set in .env}"
+            if ! logout_response=$(curl --fail --silent --show-error --request POST \
+              "https://api.telegram.org/bot${TG_TOKEN}/logOut"); then
+              pm2 restart "$app" --update-env >/dev/null || true
+              echo "Telegram cloud Bot API logout request failed" >&2
+              exit 1
+            fi
+            if [[ "$logout_response" != *'"ok":true'* ]]; then
+              pm2 restart "$app" --update-env >/dev/null || true
+              echo "Telegram cloud Bot API logout failed" >&2
+              exit 1
+            fi
+            touch "$migration_marker"
+            chmod 600 "$migration_marker"
+          fi
           if [[ -f "$binary" ]]; then
             cp -p "$binary" "$previous"
           fi

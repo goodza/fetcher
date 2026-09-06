@@ -1478,8 +1478,13 @@ async fn log_callback_download_link(kind: &str, url: &str, q: &CallbackQuery) {
 }
 
 async fn notify_error(message: &str) {
-    let url = std::env::var("ALERT_URL")
-        .unwrap_or_else(|_| "http://localhost:8888/REDACTED_ALERT_WEBHOOK_ID".to_string());
+    let url = match std::env::var("ALERT_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => {
+            log::warn!("ALERT_URL is not set; skipping error notification");
+            return;
+        }
+    };
 
     let body = serde_json::json!({ "msg": message, "url": "" });
     let client = match reqwest::Client::builder()

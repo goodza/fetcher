@@ -1,4 +1,6 @@
 target/
+.env*
+download_links.log
 *.txt
 *.srt
 *.sh

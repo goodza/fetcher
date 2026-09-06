@@ -113,11 +113,6 @@ enum DownloadKind {
     XVideo,
     YouTubeShort,
     YouTubeVideo,
-    YouTubeVideo480,
-    YouTubeVideo720,
-    YouTubeVideo1024,
-    YouTubeVideo1440,
-    YouTubeVideo2160,
     YouTubeAudio,
 }
 
@@ -130,25 +125,13 @@ impl DownloadKind {
                 | Self::XVideo
                 | Self::YouTubeShort
                 | Self::YouTubeVideo
-                | Self::YouTubeVideo480
-                | Self::YouTubeVideo720
-                | Self::YouTubeVideo1024
-                | Self::YouTubeVideo1440
-                | Self::YouTubeVideo2160
         )
     }
 
     fn is_youtube(self) -> bool {
         matches!(
             self,
-            Self::YouTubeShort
-                | Self::YouTubeVideo
-                | Self::YouTubeVideo480
-                | Self::YouTubeVideo720
-                | Self::YouTubeVideo1024
-                | Self::YouTubeVideo1440
-                | Self::YouTubeVideo2160
-                | Self::YouTubeAudio
+            Self::YouTubeShort | Self::YouTubeVideo | Self::YouTubeAudio
         )
     }
 
@@ -160,11 +143,6 @@ impl DownloadKind {
             Self::XVideo => "x",
             Self::YouTubeShort => "youtube_shorts",
             Self::YouTubeVideo => "youtube_video",
-            Self::YouTubeVideo480 => "youtube_video_480",
-            Self::YouTubeVideo720 => "youtube_video_720",
-            Self::YouTubeVideo1024 => "youtube_video_1024",
-            Self::YouTubeVideo1440 => "youtube_video_1440",
-            Self::YouTubeVideo2160 => "youtube_video_2160",
             Self::YouTubeAudio => "youtube",
         }
     }
@@ -175,13 +153,7 @@ impl DownloadKind {
             Self::InstagramPost => "Downloading post photos...",
             Self::InstagramProfile => "Scrolling profile Reels...",
             Self::XVideo => "Downloading X video...",
-            Self::YouTubeShort
-            | Self::YouTubeVideo
-            | Self::YouTubeVideo480
-            | Self::YouTubeVideo720
-            | Self::YouTubeVideo1024
-            | Self::YouTubeVideo1440
-            | Self::YouTubeVideo2160 => "Downloading video...",
+            Self::YouTubeShort | Self::YouTubeVideo => "Downloading video...",
             Self::YouTubeAudio => "Downloading audio...",
         }
     }
@@ -217,33 +189,9 @@ impl DownloadKind {
                 "--concat-playlist",
                 "always",
             ],
-            Self::YouTubeVideo | Self::YouTubeVideo1024 => &[
+            Self::YouTubeVideo => &[
                 "-f",
-                "bestvideo[height<=1024][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1024]+bestaudio/best[height<=1024][ext=mp4]/best[height<=1024]/best",
-                "--merge-output-format",
-                "mp4",
-            ],
-            Self::YouTubeVideo720 => &[
-                "-f",
-                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720][ext=mp4]/best[height<=720]/best",
-                "--merge-output-format",
-                "mp4",
-            ],
-            Self::YouTubeVideo480 => &[
-                "-f",
-                "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480][ext=mp4]/best[height<=480]/best",
-                "--merge-output-format",
-                "mp4",
-            ],
-            Self::YouTubeVideo1440 => &[
-                "-f",
-                "bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best[height<=1440][ext=mp4]/best[height<=1440]/best",
-                "--merge-output-format",
-                "mp4",
-            ],
-            Self::YouTubeVideo2160 => &[
-                "-f",
-                "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160][ext=mp4]/best[height<=2160]/best",
+                "bestvideo+bestaudio/best",
                 "--merge-output-format",
                 "mp4",
             ],
@@ -348,28 +296,8 @@ fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
 }
 
 fn parse_youtube_download_callback(data: &str) -> Option<(DownloadKind, &str)> {
-    data.strip_prefix("ytv480:")
-        .map(|id| (DownloadKind::YouTubeVideo480, id))
-        .or_else(|| {
-            data.strip_prefix("ytv720:")
-                .map(|id| (DownloadKind::YouTubeVideo720, id))
-        })
-        .or_else(|| {
-            data.strip_prefix("ytv1024:")
-                .map(|id| (DownloadKind::YouTubeVideo1024, id))
-        })
-        .or_else(|| {
-            data.strip_prefix("ytv1440:")
-                .map(|id| (DownloadKind::YouTubeVideo1440, id))
-        })
-        .or_else(|| {
-            data.strip_prefix("ytv2160:")
-                .map(|id| (DownloadKind::YouTubeVideo2160, id))
-        })
-        .or_else(|| {
-            data.strip_prefix("ytv:")
-                .map(|id| (DownloadKind::YouTubeVideo1024, id))
-        })
+    data.strip_prefix("ytv:")
+        .map(|id| (DownloadKind::YouTubeVideo, id))
         .or_else(|| {
             data.strip_prefix("yta:")
                 .map(|id| (DownloadKind::YouTubeAudio, id))
@@ -474,9 +402,9 @@ async fn handle_inline_query(
         if link.kind.is_youtube() {
             vec![inline_article(
                 "send-youtube-to-chat",
-                "Open bot chat to choose quality",
+                "Open bot chat to choose video or audio",
                 format!(
-                    "Send this YouTube link to the bot chat to choose quality or audio:\n{}",
+                    "Send this YouTube link to the bot chat to choose video or audio:\n{}",
                     link.url
                 ),
                 "Inline queries answer instantly; downloads run in bot chat.",
@@ -550,20 +478,13 @@ async fn send_youtube_menu(
         insert_download_menu(&mut downloads, id.clone(), url.to_string(), Instant::now());
     }
 
-    let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("480p", format!("ytv480:{id}")),
-            InlineKeyboardButton::callback("720p", format!("ytv720:{id}")),
-        ],
-        vec![
-            InlineKeyboardButton::callback("1024p", format!("ytv1024:{id}")),
-            InlineKeyboardButton::callback("4K", format!("ytv2160:{id}")),
-        ],
-        vec![InlineKeyboardButton::callback("Audio", format!("yta:{id}"))],
-    ]);
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("Video", format!("ytv:{id}")),
+        InlineKeyboardButton::callback("Audio", format!("yta:{id}")),
+    ]]);
 
     let result = bot
-        .send_message(chat_id, "Choose quality or audio:")
+        .send_message(chat_id, "Choose video or audio:")
         .reply_markup(keyboard)
         .await;
 
@@ -2190,12 +2111,12 @@ mod tests {
     }
 
     #[test]
-    fn youtube_video_download_args_prefer_1024p_or_best_available() {
+    fn youtube_video_download_args_request_maximum_quality() {
         assert_eq!(
             DownloadKind::YouTubeVideo.format_args(),
             &[
                 "-f",
-                "bestvideo[height<=1024][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1024]+bestaudio/best[height<=1024][ext=mp4]/best[height<=1024]/best",
+                "bestvideo+bestaudio/best",
                 "--merge-output-format",
                 "mp4"
             ]
@@ -2233,18 +2154,6 @@ mod tests {
             format!("Example channel\n{url}")
         );
         assert_eq!(media_caption(Some("  "), url), url);
-    }
-
-    #[test]
-    fn youtube_quality_download_args_use_selected_height() {
-        assert!(DownloadKind::YouTubeVideo480.format_args()[1].contains("height<=480"));
-        assert!(DownloadKind::YouTubeVideo720.format_args()[1].contains("height<=720"));
-        assert_eq!(
-            DownloadKind::YouTubeVideo1024.format_args(),
-            DownloadKind::YouTubeVideo.format_args()
-        );
-        assert!(DownloadKind::YouTubeVideo1440.format_args()[1].contains("height<=1440"));
-        assert!(DownloadKind::YouTubeVideo2160.format_args()[1].contains("height<=2160"));
     }
 
     #[test]
@@ -2286,21 +2195,10 @@ mod tests {
         assert!(matches!(kind, DownloadKind::YouTubeAudio));
         assert_eq!(id, "abc123");
 
-        let (kind, id) = parse_youtube_download_callback("ytv720:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeVideo720));
-        assert_eq!(id, "abc123");
-
-        let (kind, id) = parse_youtube_download_callback("ytv1440:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeVideo1440));
-        assert_eq!(id, "abc123");
-
-        let (kind, id) = parse_youtube_download_callback("ytv2160:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeVideo2160));
-        assert_eq!(id, "abc123");
-
         let (kind, id) = parse_youtube_download_callback("ytv:abc123").unwrap();
-        assert!(matches!(kind, DownloadKind::YouTubeVideo1024));
+        assert!(matches!(kind, DownloadKind::YouTubeVideo));
         assert_eq!(id, "abc123");
+        assert!(parse_youtube_download_callback("ytv720:abc123").is_none());
         assert!(parse_youtube_download_callback("ig:abc123").is_none());
     }
 

@@ -10,7 +10,8 @@ use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle,
-    InputFile, InputMessageContent, InputMessageContentText, MessageId,
+    InputFile, InputMedia, InputMediaPhoto, InputMessageContent, InputMessageContentText,
+    MessageId,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -98,6 +99,7 @@ async fn main() {
 #[derive(Clone, Copy)]
 enum DownloadKind {
     InstagramReel,
+    InstagramPost,
     InstagramProfile,
     XVideo,
     YouTubeShort,
@@ -156,6 +158,7 @@ impl DownloadKind {
     fn log_kind(self) -> &'static str {
         match self {
             Self::InstagramReel => "instagram",
+            Self::InstagramPost => "instagram_post",
             Self::InstagramProfile => "instagram_profile",
             Self::XVideo => "x",
             Self::YouTubeShort => "youtube_shorts",
@@ -172,6 +175,7 @@ impl DownloadKind {
     fn downloading_message(self) -> &'static str {
         match self {
             Self::InstagramReel => "Downloading reel...",
+            Self::InstagramPost => "Downloading post photos...",
             Self::InstagramProfile => "Scrolling profile Reels...",
             Self::XVideo => "Downloading X video...",
             Self::YouTubeShort
@@ -188,6 +192,7 @@ impl DownloadKind {
     fn title_fallback(self) -> &'static str {
         match self {
             Self::YouTubeAudio => "audio",
+            Self::InstagramPost => "photo",
             _ => "video",
         }
     }
@@ -195,6 +200,7 @@ impl DownloadKind {
     fn output_extension(self) -> &'static str {
         match self {
             Self::YouTubeAudio => "mp3",
+            Self::InstagramPost => "jpg",
             _ => "mp4",
         }
     }
@@ -245,6 +251,7 @@ impl DownloadKind {
                 "mp4",
             ],
             Self::YouTubeAudio => &["-x", "--audio-format", "mp3"],
+            Self::InstagramPost => &[],
             _ => &["-f", "b[ext=mp4]"],
         }
     }
@@ -260,6 +267,7 @@ impl DownloadKind {
     fn sending_message(self) -> &'static str {
         match self {
             Self::YouTubeAudio => "Sending audio...",
+            Self::InstagramPost => "Sending photos...",
             _ => "Sending video...",
         }
     }
@@ -275,6 +283,10 @@ static IG_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"https?://(?:www\.)?instagram\.com/(?:[A-Za-z0-9._]+/)?(?:reel|reels)/([A-Za-z0-9_-]+)/?",
     )
     .unwrap()
+});
+static IG_POST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"https?://(?:www\.)?instagram\.com/(?:[A-Za-z0-9._]+/)?p/([A-Za-z0-9_-]+)/?(?:[?#][^\s]*)?")
+        .unwrap()
 });
 static IG_PROFILE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9._]+)/?").unwrap());
@@ -301,6 +313,11 @@ fn find_download_link(text: &str) -> Option<DownloadLink<'_>> {
     if let Some(m) = IG_RE.find(text) {
         Some(DownloadLink {
             kind: DownloadKind::InstagramReel,
+            url: m.as_str(),
+        })
+    } else if let Some(m) = IG_POST_RE.find(text) {
+        Some(DownloadLink {
+            kind: DownloadKind::InstagramPost,
             url: m.as_str(),
         })
     } else if let Some(captures) = IG_PROFILE_RE.captures(text) {
@@ -467,7 +484,7 @@ async fn handle_inline_query(
                 ),
                 "Inline queries answer instantly; downloads run in bot chat.",
             )]
-        } else if link.kind.is_inline_video() {
+        } else if link.kind.is_inline_video() || matches!(link.kind, DownloadKind::InstagramPost) {
             vec![inline_article(
                 "send-video-to-chat",
                 "Open bot chat to download",
@@ -490,13 +507,13 @@ async fn handle_inline_query(
             "unsupported-link",
             "Unsupported link",
             "This link is not supported.",
-            "Supported: Instagram profiles or Reels, X videos, and YouTube videos or Shorts.",
+            "Supported: Instagram posts, profiles or Reels, X videos, and YouTube videos or Shorts.",
         )]
     } else {
         vec![inline_article(
             "help",
-            "Paste an Instagram profile or video link",
-            "Paste an Instagram profile or Reel, X video, or YouTube link after the bot username.",
+            "Paste an Instagram or video link",
+            "Paste an Instagram post, profile or Reel, X video, or YouTube link after the bot username.",
             "Example: @fetcher_bot https://www.instagram.com/example/",
         )]
     };
@@ -569,6 +586,14 @@ async fn download_and_send_media(
     kind: DownloadKind,
     url: &str,
 ) -> Result<(), String> {
+    if matches!(kind, DownloadKind::InstagramPost) {
+        let result = download_instagram_post_and_send(bot, chat_id, status_msg_id, url).await;
+        if result.is_ok() {
+            bot.delete_message(chat_id, status_msg_id).await.ok();
+        }
+        return result;
+    }
+
     if matches!(kind, DownloadKind::InstagramProfile) {
         let result = download_instagram_profile_and_send(bot, chat_id, status_msg_id, url).await;
         if result.is_ok() {
@@ -713,6 +738,268 @@ fn instagram_reel_shortcode(url: &str) -> Option<&str> {
         .captures(url)
         .and_then(|captures| captures.get(1))
         .map(|shortcode| shortcode.as_str())
+}
+
+fn instagram_post_shortcode(url: &str) -> Option<&str> {
+    IG_POST_RE
+        .captures(url)
+        .and_then(|captures| captures.get(1))
+        .map(|shortcode| shortcode.as_str())
+}
+
+fn instagram_cookie_header() -> Option<String> {
+    let contents = std::fs::read_to_string(cookie_file_path()?).ok()?;
+    let mut cookies = HashMap::new();
+
+    for raw_line in contents.lines() {
+        let line = raw_line.strip_prefix("#HttpOnly_").unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() < 7 || !fields[0].ends_with("instagram.com") {
+            continue;
+        }
+        cookies.insert(fields[5], fields[6]);
+    }
+
+    let mut cookies: Vec<_> = cookies.into_iter().collect();
+    cookies.sort_unstable_by_key(|(name, _)| *name);
+    (!cookies.is_empty()).then(|| {
+        cookies
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+fn best_instagram_photo_url(node: &serde_json::Value) -> Option<&str> {
+    if node
+        .get("is_video")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    node.get("display_resources")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|resources| {
+            resources.iter().max_by_key(|resource| {
+                let width = resource
+                    .get("config_width")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let height = resource
+                    .get("config_height")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                width.saturating_mul(height)
+            })
+        })
+        .and_then(|resource| resource.get("src"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| node.get("display_url").and_then(serde_json::Value::as_str))
+}
+
+fn collect_instagram_post_photos(
+    value: &serde_json::Value,
+    shortcode: &str,
+    photos: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let is_target =
+                object.get("shortcode").and_then(serde_json::Value::as_str) == Some(shortcode);
+            if is_target {
+                if let Some(edges) = object
+                    .get("edge_sidecar_to_children")
+                    .and_then(|sidecar| sidecar.get("edges"))
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for node in edges.iter().filter_map(|edge| edge.get("node")) {
+                        if let Some(url) = best_instagram_photo_url(node) {
+                            if seen.insert(url.to_string()) {
+                                photos.push(url.to_string());
+                            }
+                        }
+                    }
+                } else if let Some(url) = best_instagram_photo_url(value) {
+                    if seen.insert(url.to_string()) {
+                        photos.push(url.to_string());
+                    }
+                }
+            }
+
+            for child in object.values() {
+                collect_instagram_post_photos(child, shortcode, photos, seen);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_instagram_post_photos(child, shortcode, photos, seen);
+            }
+        }
+        serde_json::Value::String(encoded)
+            if encoded.contains(shortcode)
+                && (encoded.starts_with('{') || encoded.starts_with('[')) =>
+        {
+            if let Ok(decoded) = serde_json::from_str(encoded) {
+                collect_instagram_post_photos(&decoded, shortcode, photos, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_instagram_post_photo_urls(html: &str, shortcode: &str) -> Vec<String> {
+    const SERVER_PAYLOAD_MARKER: &str = ".handle(";
+
+    let mut photos = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = 0;
+
+    while let Some(relative) = html[cursor..].find(SERVER_PAYLOAD_MARKER) {
+        let start = cursor + relative + SERVER_PAYLOAD_MARKER.len();
+        let mut values =
+            serde_json::Deserializer::from_str(&html[start..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = values.next() {
+            collect_instagram_post_photos(&value, shortcode, &mut photos, &mut seen);
+        }
+        cursor = start;
+    }
+
+    photos
+}
+
+async fn fetch_instagram_post_photo_urls(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(String, Vec<String>), String> {
+    let shortcode = instagram_post_shortcode(url)
+        .ok_or_else(|| "Cannot determine the Instagram post shortcode".to_string())?;
+    let embed_url = format!("https://www.instagram.com/p/{shortcode}/embed/captioned/");
+    let mut request = client
+        .get(embed_url)
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0")
+        .header(reqwest::header::REFERER, "https://www.instagram.com/");
+    if let Some(cookies) = instagram_cookie_header() {
+        request = request.header(reqwest::header::COOKIE, cookies);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("Cannot open Instagram post: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("Instagram post returned HTTP {status}"));
+    }
+    let html = response
+        .text()
+        .await
+        .map_err(|e| format!("Cannot read Instagram post: {e}"))?;
+    let photos = extract_instagram_post_photo_urls(&html, shortcode);
+    if photos.is_empty() {
+        return Err("No photos were found in this Instagram post; it may be unavailable, private, video-only, or require fresh cookies".into());
+    }
+
+    Ok((shortcode.to_string(), photos))
+}
+
+async fn send_instagram_photo_batch(
+    bot: &Bot,
+    chat_id: ChatId,
+    paths: &[PathBuf],
+    first_index: usize,
+) -> Result<(), String> {
+    if paths.len() == 1 {
+        let photo = InputFile::file(&paths[0])
+            .file_name(format!("instagram-photo-{}.jpg", first_index + 1));
+        bot.send_photo(chat_id, photo)
+            .await
+            .map_err(|e| format!("Telegram API error sending photo: {e}"))?;
+        return Ok(());
+    }
+
+    let media = paths.iter().enumerate().map(|(offset, path)| {
+        InputMedia::Photo(InputMediaPhoto::new(
+            InputFile::file(path)
+                .file_name(format!("instagram-photo-{}.jpg", first_index + offset + 1)),
+        ))
+    });
+    bot.send_media_group(chat_id, media)
+        .await
+        .map_err(|e| format!("Telegram API error sending photo album: {e}"))?;
+    Ok(())
+}
+
+async fn download_instagram_post_and_send(
+    bot: &Bot,
+    chat_id: ChatId,
+    status_msg_id: MessageId,
+    url: &str,
+) -> Result<(), String> {
+    let work_dir = std::env::temp_dir().join(format!("instagram-post-{}", Uuid::new_v4()));
+    tokio::fs::create_dir(&work_dir)
+        .await
+        .map_err(|e| format!("Cannot create temporary directory: {e}"))?;
+
+    let result = async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Cannot create Instagram client: {e}"))?;
+        let (shortcode, photo_urls) = fetch_instagram_post_photo_urls(&client, url).await?;
+        let mut paths = Vec::with_capacity(photo_urls.len());
+
+        for (index, photo_url) in photo_urls.iter().enumerate() {
+            bot.edit_message_text(
+                chat_id,
+                status_msg_id,
+                format!("Downloading photo {}/{}...", index + 1, photo_urls.len()),
+            )
+            .await
+            .ok();
+            let response = client
+                .get(photo_url)
+                .header(reqwest::header::REFERER, "https://www.instagram.com/")
+                .send()
+                .await
+                .map_err(|e| format!("Cannot download Instagram photo {}: {e}", index + 1))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!(
+                    "Instagram photo {} returned HTTP {status}",
+                    index + 1
+                ));
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| format!("Cannot read Instagram photo {}: {e}", index + 1))?;
+            let path = work_dir.join(format!("{shortcode}-{index:02}.jpg"));
+            tokio::fs::write(&path, bytes)
+                .await
+                .map_err(|e| format!("Cannot save Instagram photo {}: {e}", index + 1))?;
+            paths.push(path);
+        }
+
+        bot.edit_message_text(chat_id, status_msg_id, "Sending photos...")
+            .await
+            .ok();
+        for (batch_index, batch) in paths.chunks(10).enumerate() {
+            send_instagram_photo_batch(bot, chat_id, batch, batch_index * 10).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    result
 }
 
 async fn scrape_instagram_reel_urls(
@@ -1135,7 +1422,7 @@ async fn handle_message(
         if contains_http_link(text) {
             bot.send_message(
                 msg.chat.id,
-                "Unsupported link. Supported: Instagram profiles or Reels, X videos, and YouTube videos or Shorts.",
+                "Unsupported link. Supported: Instagram posts, profiles or Reels, X videos, and YouTube videos or Shorts.",
             )
             .await?;
         }
@@ -1740,6 +2027,74 @@ mod tests {
         assert_eq!(
             instagram_reel_shortcode("https://www.instagram.com/reels/DbHN_ovssLw/"),
             Some("DbHN_ovssLw")
+        );
+    }
+
+    #[test]
+    fn finds_instagram_photo_post_with_share_query() {
+        let link =
+            find_download_link("https://www.instagram.com/p/Dc8rXEpmoDK/?stkn=Z2w2aTdwcGpqdmpv")
+                .expect("Instagram post link should be detected");
+
+        assert!(matches!(link.kind, DownloadKind::InstagramPost));
+        assert_eq!(instagram_post_shortcode(link.url), Some("Dc8rXEpmoDK"));
+        assert_eq!(
+            link.url,
+            "https://www.instagram.com/p/Dc8rXEpmoDK/?stkn=Z2w2aTdwcGpqdmpv"
+        );
+    }
+
+    #[test]
+    fn extracts_ordered_largest_photos_from_instagram_carousel_payload() {
+        let post = serde_json::json!({
+            "shortcode": "POST123",
+            "edge_sidecar_to_children": {
+                "edges": [
+                    {"node": {
+                        "is_video": false,
+                        "display_url": "https://cdn.example/fallback-1.jpg",
+                        "display_resources": [
+                            {"src": "https://cdn.example/small-1.jpg", "config_width": 320, "config_height": 320},
+                            {"src": "https://cdn.example/large-1.jpg", "config_width": 1080, "config_height": 1440}
+                        ]
+                    }},
+                    {"node": {
+                        "is_video": true,
+                        "display_url": "https://cdn.example/video-cover.jpg"
+                    }},
+                    {"node": {
+                        "is_video": false,
+                        "display_url": "https://cdn.example/photo-2.jpg"
+                    }}
+                ]
+            }
+        });
+        let payload = serde_json::json!({"define": [["PostData", [], post.to_string(), 1]]});
+        let html = format!("<script>s.handle({payload});</script>");
+
+        assert_eq!(
+            extract_instagram_post_photo_urls(&html, "POST123"),
+            vec![
+                "https://cdn.example/large-1.jpg",
+                "https://cdn.example/photo-2.jpg"
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_single_instagram_photo() {
+        let payload = serde_json::json!({
+            "shortcode": "SINGLE123",
+            "is_video": false,
+            "display_resources": [
+                {"src": "https://cdn.example/single.jpg", "config_width": 1080, "config_height": 1350}
+            ]
+        });
+        let html = format!("<script>s.handle({payload});</script>");
+
+        assert_eq!(
+            extract_instagram_post_photo_urls(&html, "SINGLE123"),
+            vec!["https://cdn.example/single.jpg"]
         );
     }
 

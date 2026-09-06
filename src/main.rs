@@ -628,9 +628,9 @@ async fn download_and_send_media(
             .ok();
 
         if kind.is_inline_video() {
-            send_video(bot, chat_id, &tmp_path, &title).await
+            send_video(bot, chat_id, &tmp_path, &title, url).await
         } else {
-            send_audio(bot, chat_id, &tmp_path, &title, channel.as_deref()).await
+            send_audio(bot, chat_id, &tmp_path, &title, channel.as_deref(), url).await
         }
     }
     .await;
@@ -911,21 +911,27 @@ async fn send_instagram_photo_batch(
     chat_id: ChatId,
     paths: &[PathBuf],
     first_index: usize,
+    caption: &str,
 ) -> Result<(), String> {
     if paths.len() == 1 {
         let photo = InputFile::file(&paths[0])
             .file_name(format!("instagram-photo-{}.jpg", first_index + 1));
         bot.send_photo(chat_id, photo)
+            .caption(caption)
             .await
             .map_err(|e| format!("Telegram API error sending photo: {e}"))?;
         return Ok(());
     }
 
     let media = paths.iter().enumerate().map(|(offset, path)| {
-        InputMedia::Photo(InputMediaPhoto::new(
+        let mut photo = InputMediaPhoto::new(
             InputFile::file(path)
                 .file_name(format!("instagram-photo-{}.jpg", first_index + offset + 1)),
-        ))
+        );
+        if offset == 0 {
+            photo = photo.caption(caption);
+        }
+        InputMedia::Photo(photo)
     });
     bot.send_media_group(chat_id, media)
         .await
@@ -989,7 +995,7 @@ async fn download_instagram_post_and_send(
             .await
             .ok();
         for (batch_index, batch) in paths.chunks(10).enumerate() {
-            send_instagram_photo_batch(bot, chat_id, batch, batch_index * 10).await?;
+            send_instagram_photo_batch(bot, chat_id, batch, batch_index * 10, url).await?;
         }
         Ok(())
     }
@@ -1323,7 +1329,7 @@ async fn download_instagram_profile_and_send(
         bot.edit_message_text(chat_id, status_msg_id, "Sending video...")
             .await
             .ok();
-        send_video(bot, chat_id, &output, &format!("{username} reels")).await
+        send_video(bot, chat_id, &output, &format!("{username} reels"), url).await
     }
     .await;
 
@@ -1782,14 +1788,18 @@ async fn send_video_with_document_fallback(
     chat_id: ChatId,
     path: &Path,
     file_name: String,
+    caption: &str,
 ) -> Result<(), teloxide::RequestError> {
     let video = InputFile::file(path).file_name(file_name.clone());
-    match bot.send_video(chat_id, video).await {
+    match bot.send_video(chat_id, video).caption(caption).await {
         Ok(_) => Ok(()),
         Err(error) if is_request_entity_too_large(&error) => {
             log::info!("Telegram rejected video upload as too large; retrying as document");
             let document = InputFile::file(path).file_name(file_name);
-            bot.send_document(chat_id, document).await.map(|_| ())
+            bot.send_document(chat_id, document)
+                .caption(caption)
+                .await
+                .map(|_| ())
         }
         Err(error) => Err(error),
     }
@@ -1801,6 +1811,7 @@ async fn send_audio(
     path: &Path,
     title: &str,
     channel: Option<&str>,
+    url: &str,
 ) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
@@ -1808,9 +1819,10 @@ async fn send_audio(
 
     if metadata.len() <= MAX_MEDIA_PREVIEW_SIZE {
         let file = InputFile::file(path).file_name(format!("{title}.mp3"));
-        let mut request = bot.send_audio(chat_id, file).title(title);
+        let caption = media_caption(channel, url);
+        let mut request = bot.send_audio(chat_id, file).title(title).caption(caption);
         if let Some(channel) = channel {
-            request = request.performer(channel).caption(channel);
+            request = request.performer(channel);
         }
         request
             .await
@@ -1825,10 +1837,9 @@ async fn send_audio(
             metadata.len() as f64 / 1024.0 / 1024.0
         );
         let file = InputFile::file(path).file_name(format!("{title}.mp3"));
-        let mut request = bot.send_document(chat_id, file);
-        if let Some(channel) = channel {
-            request = request.caption(channel);
-        }
+        let request = bot
+            .send_document(chat_id, file)
+            .caption(media_caption(channel, url));
         request
             .await
             .map_err(|e| format!("Telegram API error sending document: {e}"))?;
@@ -1844,10 +1855,9 @@ async fn send_audio(
             title.to_string()
         };
         let file = InputFile::file(chunk).file_name(format!("{label}.mp3"));
-        let mut request = bot.send_document(chat_id, file);
-        if let Some(channel) = channel {
-            request = request.caption(channel);
-        }
+        let request = bot
+            .send_document(chat_id, file)
+            .caption(media_caption(channel, url));
         request
             .await
             .map_err(|e| format!("Telegram API error on document chunk {}: {e}", i + 1))?;
@@ -1859,13 +1869,26 @@ async fn send_audio(
     Ok(())
 }
 
-async fn send_video(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Result<(), String> {
+fn media_caption(context: Option<&str>, url: &str) -> String {
+    match context.map(str::trim).filter(|context| !context.is_empty()) {
+        Some(context) => format!("{context}\n{url}"),
+        None => url.to_string(),
+    }
+}
+
+async fn send_video(
+    bot: &Bot,
+    chat_id: ChatId,
+    path: &Path,
+    title: &str,
+    url: &str,
+) -> Result<(), String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Cannot read downloaded file: {e}"))?;
 
     if metadata.len() <= MAX_MEDIA_PREVIEW_SIZE {
-        send_video_with_document_fallback(bot, chat_id, path, format!("{title}.mp4"))
+        send_video_with_document_fallback(bot, chat_id, path, format!("{title}.mp4"), url)
             .await
             .map_err(|e| format!("Telegram API error sending file: {e}"))?;
         return Ok(());
@@ -1879,6 +1902,7 @@ async fn send_video(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Res
         );
         let file = InputFile::file(path).file_name(format!("{title}.mp4"));
         bot.send_document(chat_id, file)
+            .caption(url)
             .await
             .map_err(|error| format!("Telegram API error sending document: {error}"))?;
         return Ok(());
@@ -1894,6 +1918,7 @@ async fn send_video(bot: &Bot, chat_id: ChatId, path: &Path, title: &str) -> Res
         };
         let file = InputFile::file(chunk).file_name(format!("{label}.mp4"));
         bot.send_document(chat_id, file)
+            .caption(url)
             .await
             .map_err(|e| format!("Telegram API error on document chunk {}: {e}", i + 1))?;
     }
@@ -2196,6 +2221,18 @@ mod tests {
         assert_eq!(DownloadKind::YouTubeAudio.caption_field(), Some("channel"));
         assert_eq!(DownloadKind::YouTubeVideo.caption_field(), None);
         assert_eq!(DownloadKind::InstagramReel.caption_field(), None);
+    }
+
+    #[test]
+    fn media_caption_keeps_the_submitted_link() {
+        let url = "https://youtu.be/Sv5ZZB-M59Q";
+
+        assert_eq!(media_caption(None, url), url);
+        assert_eq!(
+            media_caption(Some("Example channel"), url),
+            format!("Example channel\n{url}")
+        );
+        assert_eq!(media_caption(Some("  "), url), url);
     }
 
     #[test]

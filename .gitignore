@@ -1,6 +1,16 @@
-target/
-.env*
-download_links.log
-*.txt
-*.srt
-*.sh
+# Ignore everything by default.
+/*
+
+# Keep repository configuration.
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/compose.yaml
+
+# Keep source files.
+!/src/
+!/src/**
+
+# Keep GitHub workflows.
+!/.github/
+!/.github/**

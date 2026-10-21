@@ -72,7 +72,7 @@ async fn main() {
         std::env::set_var("RUST_LOG", "info");
     }
     pretty_env_logger::init_timed();
-    log::info!("Starting fetcher bot...");
+    log::info!("Starting fetcher bot v{}...", env!("CARGO_PKG_VERSION"));
     check_cookies().await;
 
     let token = std::env::var("TG_TOKEN").expect("TG_TOKEN must be set");
@@ -206,9 +206,11 @@ impl DownloadKind {
                 "--concat-playlist",
                 "always",
             ],
-            Self::YouTubeVideo => &[
+            // Prefer actual H.264/AAC codecs, not just MP4 (which may contain AV1).
+            // Keep other codecs as fallbacks when compatible streams are absent.
+            Self::YouTubeShort | Self::YouTubeVideo => &[
                 "-f",
-                "bestvideo+bestaudio/best",
+                "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[vcodec^=avc1][acodec^=mp4a]/bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best",
                 "--merge-output-format",
                 "mp4",
             ],
@@ -674,13 +676,12 @@ async fn download_and_send_media(
         )
         .await?;
 
-        bot.edit_message_text(chat_id, status_msg_id, kind.sending_message())
-            .await
-            .ok();
-
         if kind.is_inline_video() {
-            send_video(bot, chat_id, &tmp_path, &title, url).await
+            send_video(bot, chat_id, &tmp_path, &title, url, Some(status_msg_id)).await
         } else {
+            bot.edit_message_text(chat_id, status_msg_id, kind.sending_message())
+                .await
+                .ok();
             send_audio(bot, chat_id, &tmp_path, &title, channel.as_deref(), url).await
         }
     }
@@ -1665,7 +1666,7 @@ async fn download_instagram_profile_and_send(
             bot.edit_message_text(chat_id, status_msg_id, "Sending Reels...")
                 .await
                 .ok();
-            send_video(bot, chat_id, &output, &format!("{username} reels"), url).await?;
+            send_video(bot, chat_id, &output, &format!("{username} reels"), url, None).await?;
         }
 
         if include_photos && !media.posts.is_empty() {
@@ -2518,8 +2519,20 @@ async fn send_video(
     path: &Path,
     title: &str,
     url: &str,
+    status_msg_id: Option<MessageId>,
 ) -> Result<(), String> {
+    if let Some(msg_id) = status_msg_id {
+        bot.edit_message_text(chat_id, msg_id, "Converting…")
+            .await
+            .ok();
+    }
+    log::info!("Preparing video for Telegram: {}", path.display());
     let prepared = prepare_video_for_telegram(path).await?;
+    if let Some(msg_id) = status_msg_id {
+        bot.edit_message_text(chat_id, msg_id, "Sending video...")
+            .await
+            .ok();
+    }
     let result = send_prepared_video(bot, chat_id, &prepared, title, url).await;
     let _ = tokio::fs::remove_file(prepared).await;
     result
@@ -2687,6 +2700,9 @@ async fn validate_chunk_sizes(chunks: &[PathBuf], max_size: u64) -> Result<(), S
 }
 
 #[cfg(test)]
+mod media_status_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2836,16 +2852,18 @@ mod tests {
     }
 
     #[test]
-    fn youtube_video_download_args_request_maximum_quality() {
-        assert_eq!(
-            DownloadKind::YouTubeVideo.format_args(),
-            &[
-                "-f",
-                "bestvideo+bestaudio/best",
-                "--merge-output-format",
-                "mp4"
-            ]
-        );
+    fn youtube_video_and_shorts_prefer_h264_aac_with_fallback() {
+        for kind in [DownloadKind::YouTubeVideo, DownloadKind::YouTubeShort] {
+            assert_eq!(
+                kind.format_args(),
+                &[
+                    "-f",
+                    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[vcodec^=avc1][acodec^=mp4a]/bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best",
+                    "--merge-output-format",
+                    "mp4"
+                ]
+            );
+        }
     }
 
     #[test]

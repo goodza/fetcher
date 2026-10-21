@@ -36,7 +36,7 @@ fn fixture(dir: &Path, video: &str, audio: &str) -> PathBuf {
 }
 
 // Capture editMessageText and sendVideo requests without real bot credentials.
-fn mock_api(
+pub(super) fn mock_api(
     count: usize,
 ) -> (
     reqwest::Url,
@@ -105,7 +105,13 @@ fn mock_api(
                 reader.read_exact(&mut body).unwrap();
             }
             requests.push((first.split_whitespace().nth(1).unwrap().to_string(), body));
-            let response = r#"{"ok":true,"result":{"message_id":42,"date":1,"chat":{"id":123,"type":"private"},"text":"ok"}}"#;
+            let response = if first.contains("/AnswerCallbackQuery")
+                || first.contains("/DeleteMessage")
+            {
+                r#"{"ok":true,"result":true}"#
+            } else {
+                r#"{"ok":true,"result":{"message_id":42,"date":1,"chat":{"id":123,"type":"private"},"text":"ok"}}"#
+            };
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
         }
         requests

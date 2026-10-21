@@ -18,6 +18,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::Instant;
 use uuid::Uuid;
 
+mod subtitle_ui;
+mod youtube_subtitles;
+
 const DOWNLOAD_MENU_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_DOWNLOAD_MENUS: usize = 1_024;
 const REEL_TRANSITION_SECONDS: f64 = 0.5;
@@ -58,9 +61,12 @@ impl Drop for WaitingDownload {
     }
 }
 
+#[derive(Clone)]
 struct DownloadMenu {
     url: String,
     created_at: Instant,
+    chat_id: Option<ChatId>,
+    subtitles: Vec<youtube_subtitles::SubtitleTrack>,
 }
 
 type DownloadStore = Arc<Mutex<HashMap<String, DownloadMenu>>>;
@@ -427,6 +433,8 @@ fn insert_download_menu(
         DownloadMenu {
             url,
             created_at: now,
+            chat_id: None,
+            subtitles: Vec::new(),
         },
     );
 }
@@ -451,7 +459,7 @@ async fn handle_inline_query(
                 "send-youtube-to-chat",
                 "Open bot chat to choose video or audio",
                 format!(
-                    "Send this YouTube link to the bot chat to choose video or audio:\n{}",
+                    "Send this YouTube link to the bot chat to choose video, audio or available subtitles:\n{}",
                     link.url
                 ),
                 "Inline queries answer instantly; downloads run in bot chat.",
@@ -528,21 +536,35 @@ async fn send_youtube_menu(
     chat_id: ChatId,
     url: &str,
     downloads: &DownloadStore,
+    queue: &DownloadQueue,
 ) -> ResponseResult<()> {
+    let checking = bot
+        .send_message(chat_id, "Checking available subtitles...")
+        .await?;
+    let probe = {
+        let _permit = acquire_download_permit(queue, bot, chat_id, checking.id).await;
+        youtube_subtitles::available_tracks(url).await
+    };
+    let tracks = match probe {
+        Ok(tracks) => tracks,
+        Err(error) => {
+            log::warn!("YouTube subtitle availability check failed: {error}");
+            Vec::new()
+        }
+    };
+    let has_subtitles = !tracks.is_empty();
     let id = Uuid::new_v4().to_string();
     {
         let mut downloads = downloads.lock().expect("download store lock poisoned");
         insert_download_menu(&mut downloads, id.clone(), url.to_string(), Instant::now());
+        let menu = downloads.get_mut(&id).expect("menu just inserted");
+        menu.chat_id = Some(chat_id);
+        menu.subtitles = tracks;
     }
 
-    let keyboard = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("Video", format!("ytv:{id}")),
-        InlineKeyboardButton::callback("Audio", format!("yta:{id}")),
-    ]]);
-
     let result = bot
-        .send_message(chat_id, "Choose video or audio:")
-        .reply_markup(keyboard)
+        .edit_message_text(chat_id, checking.id, subtitle_ui::menu_text(has_subtitles))
+        .reply_markup(subtitle_ui::youtube_menu_keyboard(&id, has_subtitles))
         .await;
 
     if result.is_err() {
@@ -1789,6 +1811,9 @@ async fn handle_callback_query(
     let Some(data) = q.data.as_deref() else {
         return Ok(());
     };
+    if let Some(choice) = subtitle_ui::parse_callback(data) {
+        return subtitle_ui::handle_callback(&bot, &q, choice, &queue, &downloads).await;
+    }
     let Some((kind, id)) = parse_download_callback(data) else {
         return Ok(());
     };
@@ -1809,11 +1834,19 @@ async fn handle_callback_query(
         return Ok(());
     };
     let chat_id = message.chat.id;
-    let status_msg_id = message.id;
+    let mut status_msg_id = message.id;
 
     let url = {
         let mut downloads = downloads.lock().expect("download store lock poisoned");
-        take_download_url(&mut downloads, id, Instant::now())
+        if kind.is_youtube() {
+            prune_download_menus(&mut downloads, Instant::now());
+            downloads
+                .get(id)
+                .filter(|menu| menu.chat_id == Some(chat_id))
+                .map(|menu| menu.url.clone())
+        } else {
+            take_download_url(&mut downloads, id, Instant::now())
+        }
     };
     let Some(url) = url else {
         bot.answer_callback_query(q.id)
@@ -1826,12 +1859,20 @@ async fn handle_callback_query(
     };
 
     bot.answer_callback_query(q.id.clone()).await?;
-    bot.edit_message_reply_markup(chat_id, status_msg_id)
-        .reply_markup(InlineKeyboardMarkup::new(
-            Vec::<Vec<InlineKeyboardButton>>::new(),
-        ))
-        .await
-        .ok();
+    if kind.is_youtube() {
+        // Keep the menu so subtitles and media can be downloaded independently.
+        status_msg_id = bot
+            .send_message(chat_id, kind.downloading_message())
+            .await?
+            .id;
+    } else {
+        bot.edit_message_reply_markup(chat_id, status_msg_id)
+            .reply_markup(InlineKeyboardMarkup::new(
+                Vec::<Vec<InlineKeyboardButton>>::new(),
+            ))
+            .await
+            .ok();
+    }
 
     let result = {
         let _permit = acquire_download_permit(&queue, &bot, chat_id, status_msg_id).await;
@@ -1899,7 +1940,7 @@ async fn handle_message(
     };
 
     if link.kind.is_youtube() {
-        send_youtube_menu(&bot, msg.chat.id, link.url, &downloads).await?;
+        send_youtube_menu(&bot, msg.chat.id, link.url, &downloads, &queue).await?;
         return Ok(());
     }
 
@@ -3050,6 +3091,8 @@ mod tests {
             DownloadMenu {
                 url: "https://youtu.be/expired".into(),
                 created_at: now - DOWNLOAD_MENU_TTL,
+                chat_id: None,
+                subtitles: Vec::new(),
             },
         );
 

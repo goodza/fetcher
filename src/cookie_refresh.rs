@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(10);
-const SUCCESS_TTL: Duration = Duration::from_secs(300);
+const SUCCESS_TTL: Duration = Duration::from_secs(600);
 const FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 const HEADER: &str = "# Netscape HTTP Cookie File";
 static STATE: Mutex<RefreshState> = Mutex::const_new(RefreshState::new());
@@ -22,45 +22,94 @@ struct Config {
 
 struct RefreshState {
     next_attempt: Option<Instant>,
+    failure_until: Option<Instant>,
+    last_success: Option<Instant>,
+    last_error_attempt: Option<Instant>,
 }
 
 impl RefreshState {
     const fn new() -> Self {
-        Self { next_attempt: None }
+        Self {
+            next_attempt: None,
+            failure_until: None,
+            last_success: None,
+            last_error_attempt: None,
+        }
     }
 
     async fn refresh(&mut self, config: &Config, timeout: Duration) -> Option<bool> {
         if self.next_attempt.is_some_and(|next| Instant::now() < next) {
             return None;
         }
-        // Cancellation must not bypass the failure cooldown either.
-        self.next_attempt = Some(Instant::now() + FAILURE_BACKOFF);
+        Some(self.update(config, timeout).await)
+    }
+
+    async fn refresh_after_error(
+        &mut self,
+        config: &Config,
+        timeout: Duration,
+        started: Instant,
+    ) -> bool {
+        // Check before cooldowns: all jobs using the superseded cookies may retry.
+        // A cached pre-work refresh never advances last_success.
+        if self.last_success.is_some_and(|updated| updated > started) {
+            return true;
+        }
+        let now = Instant::now();
+        if self.failure_until.is_some_and(|until| now < until)
+            || self
+                .last_error_attempt
+                .is_some_and(|last| now.duration_since(last) < FAILURE_BACKOFF)
+        {
+            return false;
+        }
+        // Separate from success TTL; also survives cancellation during the request.
+        self.last_error_attempt = Some(now);
+        self.update(config, timeout).await
+    }
+
+    async fn update(&mut self, config: &Config, timeout: Duration) -> bool {
+        // Set both guards BEFORE awaiting, so cancellation remains fail-open/backed off.
+        let until = Instant::now() + FAILURE_BACKOFF;
+        self.next_attempt = Some(until);
+        self.failure_until = Some(until);
         let success = refresh_once(config, timeout).await.is_ok();
+        let now = Instant::now();
+        if success {
+            self.last_success = Some(now);
+            self.failure_until = None;
+        } else {
+            self.failure_until = Some(now + FAILURE_BACKOFF);
+        }
         self.next_attempt = Some(
-            Instant::now()
-                + if success {
-                    SUCCESS_TTL
-                } else {
-                    FAILURE_BACKOFF
-                },
+            now + if success {
+                SUCCESS_TTL
+            } else {
+                FAILURE_BACKOFF
+            },
         );
-        Some(success)
+        success
     }
 }
 
-/// Disabled unless explicitly configured; failure never prevents a download.
-/// Keep the lock across I/O so simultaneous callers share one refresh attempt.
-pub(super) async fn refresh_if_configured() {
-    let Some(url) = std::env::var_os("COOKIE_REFRESH_URL") else {
-        return;
-    };
-    let config = Config {
-        url: url.into_string().unwrap_or_default(),
+fn configured() -> Option<Config> {
+    Some(Config {
+        url: std::env::var_os("COOKIE_REFRESH_URL")?
+            .into_string()
+            .unwrap_or_default(),
         token_file: std::env::var_os("COOKIE_REFRESH_TOKEN_FILE")
             .map(PathBuf::from)
             .unwrap_or_default(),
         // Match the downloader's existing lookup; bootstrap into cwd if absent.
         cookies_file: super::cookie_file_path().unwrap_or_else(|| PathBuf::from("cookies.txt")),
+    })
+}
+
+/// Disabled unless explicitly configured; failure never prevents a download.
+/// Keep the lock across I/O so simultaneous callers share one refresh attempt.
+pub(super) async fn refresh_if_configured() {
+    let Some(config) = configured() else {
+        return;
     };
     match STATE.lock().await.refresh(&config, TIMEOUT).await {
         Some(true) => log::info!("Cookies refreshed from PC webhook"),
@@ -70,6 +119,95 @@ pub(super) async fn refresh_if_configured() {
         }
         None => {}
     }
+}
+
+pub(super) async fn refresh_after_error(started: Instant) -> bool {
+    let Some(config) = configured() else {
+        return false;
+    };
+    STATE
+        .lock()
+        .await
+        .refresh_after_error(&config, TIMEOUT, started)
+        .await
+}
+
+/// Shared bounded retry policy for buffered AND progress-streamed yt-dlp commands.
+/// Only an actual unsuccessful exit qualifies, never a spawn/read/wait/timeout error.
+pub(super) async fn run_with_retry<T, E, F, Fut>(use_cookies: bool, attempt: F) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(std::process::ExitStatus, T), E>>,
+{
+    run_with_refresh(use_cookies, attempt, refresh_after_error).await
+}
+
+async fn run_with_refresh<T, E, F, Fut, R, RFut>(
+    use_cookies: bool,
+    mut attempt: F,
+    mut refresh: R,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(std::process::ExitStatus, T), E>>,
+    R: FnMut(Instant) -> RFut,
+    RFut: std::future::Future<Output = bool>,
+{
+    // Callers have completed normal TTL refresh before entering this wrapper.
+    let started = Instant::now();
+    let (status, output) = attempt().await?;
+    if status.success() || !use_cookies {
+        return Ok(output);
+    }
+    if !refresh(started).await {
+        return Ok(output);
+    }
+    log::info!("yt-dlp failed; refreshed cookies, retrying once");
+    let (_, output) = attempt().await?;
+    Ok(output)
+}
+
+pub(super) async fn run_output<F>(
+    command: F,
+    use_cookies: bool,
+    deadline: Option<Duration>,
+) -> std::io::Result<std::process::Output>
+where
+    F: FnMut() -> tokio::process::Command,
+{
+    run_output_with_refresh(command, use_cookies, deadline, refresh_after_error).await
+}
+
+async fn run_output_with_refresh<F, R, RFut>(
+    mut command: F,
+    use_cookies: bool,
+    deadline: Option<Duration>,
+    refresh: R,
+) -> std::io::Result<std::process::Output>
+where
+    F: FnMut() -> tokio::process::Command,
+    R: FnMut(Instant) -> RFut,
+    RFut: std::future::Future<Output = bool>,
+{
+    run_with_refresh(
+        use_cookies,
+        || {
+            let mut command = command();
+            command.kill_on_drop(true);
+            async move {
+                let output = if let Some(deadline) = deadline {
+                    tokio::time::timeout(deadline, command.output())
+                        .await
+                        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??
+                } else {
+                    command.output().await?
+                };
+                Ok((output.status, output))
+            }
+        },
+        refresh,
+    )
+    .await
 }
 
 fn loopback_url(value: &str) -> Result<reqwest::Url, ()> {
@@ -342,6 +480,355 @@ mod tests {
         }
     }
 
+    async fn force_with_state(
+        state: &Mutex<RefreshState>,
+        config: &Config,
+        started: Instant,
+        barrier: Option<&tokio::sync::Barrier>,
+    ) -> bool {
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+        state
+            .lock()
+            .await
+            .refresh_after_error(config, TIMEOUT, started)
+            .await
+    }
+
+    #[tokio::test]
+    async fn error_refresh_bypasses_success_ttl_but_has_its_own_cooldown() {
+        let directory = Directory::new();
+        let (url, initial) = server("200 OK", GOOD.into(), Duration::ZERO);
+        let mut config = directory.config(url);
+        let mut state = RefreshState::new();
+        assert_eq!(state.refresh(&config, TIMEOUT).await, Some(true));
+        initial.join().unwrap();
+        let started = Instant::now();
+        let (url, forced) = server("200 OK", GOOD.into(), Duration::ZERO);
+        config.url = url;
+        assert!(state.refresh_after_error(&config, TIMEOUT, started).await);
+        forced.join().unwrap();
+        // Every concurrent job that started with the old cookies may retry.
+        assert!(state.refresh_after_error(&config, TIMEOUT, started).await);
+        // A new permanent error after the successful forced update may not storm.
+        assert!(
+            !state
+                .refresh_after_error(&config, TIMEOUT, Instant::now())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn error_refresh_failure_backoff_retains_old_cookies() {
+        let directory = Directory::new();
+        let (url, server) = server("503 Unavailable", GOOD.into(), Duration::ZERO);
+        let config = directory.config(url);
+        std::fs::write(&config.cookies_file, GOOD).unwrap();
+        let mut state = RefreshState::new();
+        let started = Instant::now();
+        assert!(!state.refresh_after_error(&config, TIMEOUT, started).await);
+        server.join().unwrap();
+        assert!(!state.refresh_after_error(&config, TIMEOUT, started).await);
+        assert_eq!(state.refresh(&config, TIMEOUT).await, None);
+        assert_eq!(std::fs::read_to_string(&config.cookies_file).unwrap(), GOOD);
+    }
+
+    #[tokio::test]
+    async fn normal_refresh_failure_blocks_forced_request_and_cooldowns_expire() {
+        let directory = Directory::new();
+        let (url, failed) = server("503 Unavailable", GOOD.into(), Duration::ZERO);
+        let mut config = directory.config(url);
+        let mut state = RefreshState::new();
+        assert_eq!(state.refresh(&config, TIMEOUT).await, Some(false));
+        failed.join().unwrap();
+        assert!(
+            !state
+                .refresh_after_error(&config, TIMEOUT, Instant::now())
+                .await
+        );
+        assert!(
+            state.last_error_attempt.is_none(),
+            "failure backoff must skip even a forced request"
+        );
+        state.failure_until = Some(Instant::now() - Duration::from_secs(1));
+        let (url, refreshed) = server("200 OK", GOOD.into(), Duration::ZERO);
+        config.url = url;
+        assert!(
+            state
+                .refresh_after_error(&config, TIMEOUT, Instant::now())
+                .await
+        );
+        refreshed.join().unwrap();
+        // Forced success cooldown expires even while regular TTL remains active.
+        state.last_error_attempt = Some(Instant::now() - FAILURE_BACKOFF);
+        let (url, refreshed) = server("200 OK", GOOD.into(), Duration::ZERO);
+        config.url = url;
+        assert!(
+            state
+                .refresh_after_error(&config, TIMEOUT, Instant::now())
+                .await
+        );
+        refreshed.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn simultaneous_errors_coalesce_and_each_can_retry() {
+        let directory = Directory::new();
+        let (url, server) = server("200 OK", GOOD.into(), Duration::from_millis(25));
+        let config = directory.config(url);
+        let state = Mutex::new(RefreshState::new());
+        let started = Instant::now();
+        let force = || async {
+            state
+                .lock()
+                .await
+                .refresh_after_error(&config, TIMEOUT, started)
+                .await
+        };
+        assert_eq!(
+            tokio::join!(force(), force(), force(), force()),
+            (true, true, true, true)
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_subprocess_failure_refreshes_then_retries_same_operation_once() {
+        let directory = Directory::new();
+        let (url, server) = server("200 OK", GOOD.into(), Duration::ZERO);
+        let config = directory.config(url);
+        let state = Mutex::new(RefreshState::new());
+        let count = directory.0.join("attempts");
+        let output = run_output_with_refresh(
+            || {
+                let mut command = tokio::process::Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg("echo attempt >> \"$1\"; test -s \"$2\"")
+                    .arg("fixture")
+                    .arg(&count)
+                    .arg(&config.cookies_file);
+                command
+            },
+            true,
+            None,
+            |started| force_with_state(&state, &config, started, None),
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 2);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_subprocess_failure_refreshes_and_resumes_same_partial() {
+        let directory = Directory::new();
+        let (url, server) = server("200 OK", GOOD.into(), Duration::ZERO);
+        let config = directory.config(url);
+        let state = Mutex::new(RefreshState::new());
+        let partial = directory.0.join("media.part");
+        let attempts = std::cell::Cell::new(0);
+        let bot = crate::Bot::new("fixture")
+            .set_api_url(reqwest::Url::parse("http://127.0.0.1:9").unwrap());
+        let status = run_with_refresh(true, || {
+            attempts.set(attempts.get() + 1);
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", "printf '%s\\n' '[download] 1.0% fixture'; echo fixture-stderr >&2; if test -s \"$1\"; then test -s \"$2\"; else echo partial > \"$2\"; exit 1; fi", "fixture"])
+                .arg(&config.cookies_file).arg(&partial);
+            let bot = &bot;
+            async move {
+                let status = crate::download_progress_command(command, bot, crate::ChatId(1), crate::MessageId(1)).await?;
+                Ok::<_, String>((status, status))
+            }
+        }, |started| force_with_state(&state, &config, started, None)).await.unwrap();
+        assert!(status.success());
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(std::fs::read_to_string(partial).unwrap(), "partial\n");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn subprocess_retry_exhaustion_is_bounded() {
+        let attempts = std::cell::Cell::new(0);
+        let refreshes = std::cell::Cell::new(0);
+        let output = run_output_with_refresh(
+            || {
+                attempts.set(attempts.get() + 1);
+                let mut c = tokio::process::Command::new("sh");
+                c.args(["-c", "exit 1"]);
+                c
+            },
+            true,
+            None,
+            |_| {
+                refreshes.set(refreshes.get() + 1);
+                std::future::ready(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!output.status.success());
+        assert_eq!((attempts.get(), refreshes.get()), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn success_spawn_timeout_x_and_failed_refresh_do_not_retry() {
+        for (program, script, use_cookies, timeout, successful, refresh_count) in [
+            ("sh", "exit 0", true, None, true, 0),
+            ("/nonexistent/fetcher-yt-dlp", "", true, None, false, 0),
+            (
+                "sh",
+                "exec sleep 1",
+                true,
+                Some(Duration::from_millis(10)),
+                false,
+                0,
+            ),
+            ("sh", "exit 1", false, None, false, 0),
+            ("sh", "exit 1", true, None, false, 1),
+        ] {
+            let attempts = std::cell::Cell::new(0);
+            let refreshes = std::cell::Cell::new(0);
+            let result = run_output_with_refresh(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    let mut c = tokio::process::Command::new(program);
+                    c.args(["-c", script]);
+                    c
+                },
+                use_cookies,
+                timeout,
+                |_| {
+                    refreshes.set(refreshes.get() + 1);
+                    std::future::ready(false)
+                },
+            )
+            .await;
+            if timeout.is_some() {
+                assert_eq!(
+                    result.as_ref().unwrap_err().kind(),
+                    std::io::ErrorKind::TimedOut
+                );
+            } else if program.starts_with("/nonexistent/") {
+                assert_eq!(
+                    result.as_ref().unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+            assert_eq!(result.is_ok_and(|o| o.status.success()), successful);
+            assert_eq!((attempts.get(), refreshes.get()), (1, refresh_count));
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_failed_subprocesses_each_retry_after_one_refresh() {
+        let directory = Directory::new();
+        let (url, server) = server("200 OK", GOOD.into(), Duration::from_millis(25));
+        let config = directory.config(url);
+        let state = Mutex::new(RefreshState::new());
+        let barrier = tokio::sync::Barrier::new(4);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let run = || async {
+            run_output_with_refresh(
+                || {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut command = tokio::process::Command::new("sh");
+                    command
+                        .args(["-c", "test -s \"$1\"", "fixture"])
+                        .arg(&config.cookies_file);
+                    command
+                },
+                true,
+                None,
+                |started| force_with_state(&state, &config, started, Some(&barrier)),
+            )
+            .await
+            .unwrap()
+            .status
+            .success()
+        };
+        assert_eq!(
+            tokio::join!(run(), run(), run(), run()),
+            (true, true, true, true)
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 8);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_error_refresh_keeps_both_cooldowns() {
+        let directory = Directory::new();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let (url, server) = server_with_signal(
+            "200 OK",
+            GOOD.into(),
+            Duration::from_millis(150),
+            Some(sent),
+        );
+        let config = directory.config(url);
+        let mut state = RefreshState::new();
+        {
+            let refresh = state.refresh_after_error(&config, TIMEOUT, Instant::now());
+            tokio::pin!(refresh);
+            // Cancel only after the fixture has read the request, not on a
+            // scheduler-sensitive timeout that can close a half-written header.
+            tokio::select! {
+                biased;
+                received = received => received.unwrap(),
+                _ = &mut refresh => panic!("refresh completed before cancellation"),
+            }
+        }
+        assert!(state.last_error_attempt.is_some());
+        assert!(
+            !state
+                .refresh_after_error(&config, TIMEOUT, Instant::now())
+                .await
+        );
+        assert_eq!(state.refresh(&config, TIMEOUT).await, None);
+        assert!(!config.cookies_file.exists());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires authorized running Firefox bridge and token file"]
+    async fn live_cookie_refresh_after_yt_dlp_error() {
+        let directory = Directory::new();
+        let config = Config {
+            url: std::env::var("FETCHER_LIVE_COOKIE_URL").expect("set live bridge URL"),
+            token_file: std::env::var_os("FETCHER_LIVE_COOKIE_TOKEN_FILE")
+                .map(PathBuf::from)
+                .expect("set live bridge token file"),
+            cookies_file: directory.0.join("cookies.txt"),
+        };
+        let state = Mutex::new(RefreshState::new());
+        let attempts = std::cell::Cell::new(0);
+        let output = run_output_with_refresh(
+            || {
+                attempts.set(attempts.get() + 1);
+                let mut command = tokio::process::Command::new("sh");
+                command
+                    .args(["-c", "test -s \"$1\"", "fixture"])
+                    .arg(&config.cookies_file);
+                command
+            },
+            true,
+            None,
+            |started| force_with_state(&state, &config, started, None),
+        )
+        .await
+        .expect("fixture subprocess should start");
+        assert!(
+            output.status.success(),
+            "live error-triggered refresh/retry failed"
+        );
+        assert_eq!(attempts.get(), 2);
+        let contents = std::fs::read_to_string(&config.cookies_file).unwrap();
+        assert!(validated_rows(&contents).is_ok());
+        println!("Live error-triggered refresh: validated isolated cookies, subprocess succeeded on attempt 2");
+    }
+
     #[test]
     fn loopback_http_only() {
         for url in [
@@ -436,6 +923,15 @@ mod tests {
         body: String,
         delay: Duration,
     ) -> (String, std::thread::JoinHandle<()>) {
+        server_with_signal(status, body, delay, None)
+    }
+
+    fn server_with_signal(
+        status: &str,
+        body: String,
+        delay: Duration,
+        received: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/refresh", listener.local_addr().unwrap());
         let status = status.to_string();
@@ -454,6 +950,9 @@ mod tests {
             let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
             assert!(request.starts_with("post /refresh http/1.1\r\n"));
             assert!(request.contains("\r\nauthorization: bearer fixture-token\r\n"));
+            if let Some(received) = received {
+                let _ = received.send(());
+            }
             std::thread::sleep(delay);
             let response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nLocation: http://127.0.0.1:1/forbidden\r\nConnection: close\r\n\r\n{body}", body.len());
             let _ = socket.write_all(response.as_bytes());
@@ -480,7 +979,7 @@ mod tests {
             .next_attempt
             .unwrap()
             .saturating_duration_since(Instant::now());
-        assert!(remaining > Duration::from_secs(295));
+        assert!(remaining > Duration::from_secs(595));
         state.next_attempt = None;
         assert_eq!(
             state.refresh(&config, Duration::from_secs(2)).await,

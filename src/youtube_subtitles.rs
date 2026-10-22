@@ -18,11 +18,15 @@ pub(super) struct SubtitleTrack {
 }
 
 pub(super) async fn available_tracks(url: &str) -> Result<Vec<SubtitleTrack>, String> {
-    super::cookie_refresh::refresh_if_configured().await;
+    let use_cookies = super::should_use_cookies(url);
+    if use_cookies {
+        super::cookie_refresh::refresh_if_configured().await;
+    }
     let output = run_command(
-        discovery_command(url),
+        || discovery_command(url),
         DISCOVERY_TIMEOUT,
         "Subtitle discovery",
+        use_cookies,
     )
     .await?;
     let info: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -39,7 +43,10 @@ pub(super) async fn download(
     if !valid_language(&track.language) {
         return Err("Invalid subtitle language selection.".into());
     }
-    super::cookie_refresh::refresh_if_configured().await;
+    let use_cookies = super::should_use_cookies(url);
+    if use_cookies {
+        super::cookie_refresh::refresh_if_configured().await;
+    }
     std::fs::create_dir_all(work_dir)
         .map_err(|_| "Could not create the subtitle working directory.".to_string())?;
     let root = std::fs::canonicalize(work_dir)
@@ -51,9 +58,10 @@ pub(super) async fn download(
         .map_err(|_| "Could not create the subtitle download directory.".to_string())?;
     let result = async {
         run_command(
-            download_command(url, track, &directory),
+            || download_command(url, track, &directory),
             DOWNLOAD_TIMEOUT,
             "Subtitle download",
+            use_cookies,
         )
         .await?;
         find_srt(&directory)
@@ -65,17 +73,24 @@ pub(super) async fn download(
     result
 }
 
-async fn run_command(
-    mut command: Command,
+async fn run_command<F>(
+    command: F,
     deadline: Duration,
     operation: &str,
-) -> Result<Output, String> {
-    // Dropping output() on a timeout/cancel also drops and kills the owned child.
-    command.kill_on_drop(true);
-    let output = tokio::time::timeout(deadline, command.output())
+    use_cookies: bool,
+) -> Result<Output, String>
+where
+    F: FnMut() -> Command,
+{
+    let output = super::cookie_refresh::run_output(command, use_cookies, Some(deadline))
         .await
-        .map_err(|_| format!("{operation} timed out. Please try again later."))?
-        .map_err(|_| format!("{operation} could not start yt-dlp or read its output."))?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                format!("{operation} timed out. Please try again later.")
+            } else {
+                format!("{operation} could not start yt-dlp or read its output.")
+            }
+        })?;
     if !output.status.success() {
         // yt-dlp stderr/JSON can contain signed URLs and cookie paths. Never expose them.
         return Err(format!(
@@ -157,7 +172,7 @@ fn is_native_format(format: &serde_json::Value) -> bool {
         && !url.query_pairs().any(|(key, _)| key == "tlang")
 }
 
-fn common_command() -> Command {
+fn common_command(url: &str) -> Command {
     let mut command = Command::new("yt-dlp");
     command.args([
         "--ignore-config",
@@ -175,13 +190,15 @@ fn common_command() -> Command {
         "--fragment-retries",
         "1",
     ]);
-    super::add_cookie_args(&mut command);
+    if super::should_use_cookies(url) {
+        super::add_cookie_args(&mut command);
+    }
     command.kill_on_drop(true).stderr(Stdio::null());
     command
 }
 
 fn discovery_command(url: &str) -> Command {
-    let mut command = common_command();
+    let mut command = common_command(url);
     command
         .args(["--dump-single-json", "--", url])
         .stdout(Stdio::piped());
@@ -189,7 +206,7 @@ fn discovery_command(url: &str) -> Command {
 }
 
 fn download_command(url: &str, track: &SubtitleTrack, directory: &Path) -> Command {
-    let mut command = common_command();
+    let mut command = common_command(url);
     if track.automatic {
         command.args(["--write-auto-subs", "--no-write-subs"]);
     } else {

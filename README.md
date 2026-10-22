@@ -1,4 +1,4 @@
-# Fetcher 0.1.3
+# Fetcher 0.1.4
 
 Rust Telegram media downloader. Run `cargo test --locked`, then
 `cargo build --release --locked`. Pushing `main` runs the gsweb deployment workflow
@@ -61,10 +61,21 @@ COOKIE_REFRESH_TOKEN_FILE=/home/edzlf/fetcher/.cookie-refresh-token
 ```
 
 Fetcher refreshes before cookie-using work and its startup cookie check.
-Concurrent requests share one refresh; successful refreshes are cached for five
+Concurrent requests share one refresh; successful refreshes are cached for ten
 minutes, failures back off for one minute. Refresh failures retain the last good
 `cookies.txt`, so the PC being offline does not immediately break downloads.
 The response is bounded and validated before an atomic mode-600 replacement.
+
+If a cookie-using yt-dlp operation exits with an error, fetcher requests a forced
+refresh, bypassing the ten-minute success cache, and retries that operation
+**once** after a successful refresh. This covers downloads, metadata, startup
+checks, and YouTube subtitle discovery/download. Concurrent failures reuse a
+refresh completed after their first attempt began. Forced refreshes are limited
+to one per minute, including persistent extraction failures; unavailable PC or
+rejected cookies preserve the old jar. X downloads remain cookie-free. Process
+startup, FFmpeg preparation, and Telegram upload errors do not trigger refresh.
+A second yt-dlp failure is returned normally: no infinite retry loop.
+
 Unset `COOKIE_REFRESH_URL` to disable automatic refresh entirely.
 
 The gsweb PM2 app `fetcher-cookie-tunnel` runs the STCP visitor with protected

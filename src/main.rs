@@ -2110,21 +2110,30 @@ async fn check_cookies() {
         None => log::info!("Checking yt-dlp cookies from browser: {}", cookie_browser()),
     }
 
-    let mut cmd = tokio::process::Command::new("yt-dlp");
-    cmd.args([
-        "--print",
-        "title",
-        "--no-download",
-        "--js-runtimes",
-        "node",
-        "--remote-components",
-        "ejs:github",
-        "--verbose",
-        CHECK_URL,
-    ]);
-    add_cookie_args(&mut cmd);
+    cookie_refresh::refresh_if_configured().await;
+    let result = cookie_refresh::run_output(
+        || {
+            let mut cmd = tokio::process::Command::new("yt-dlp");
+            cmd.args([
+                "--print",
+                "title",
+                "--no-download",
+                "--js-runtimes",
+                "node",
+                "--remote-components",
+                "ejs:github",
+                "--verbose",
+                CHECK_URL,
+            ]);
+            add_cookie_args(&mut cmd);
+            cmd
+        },
+        true,
+        None,
+    )
+    .await;
 
-    match cmd.output().await {
+    match result {
         Ok(output) if output.status.success() => {
             let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
             log::info!("yt-dlp cookie check OK: {title}");
@@ -2169,6 +2178,48 @@ async fn download_with_progress(
     chat_id: ChatId,
     msg_id: MessageId,
 ) -> Result<(), String> {
+    let use_cookies = should_use_cookies(url);
+    if use_cookies {
+        cookie_refresh::refresh_if_configured().await;
+    }
+    let status = cookie_refresh::run_with_retry(use_cookies, || async {
+        let status = download_progress_attempt(
+            url,
+            output,
+            format_args,
+            metadata_args,
+            bot,
+            chat_id,
+            msg_id,
+        )
+        .await?;
+        Ok::<_, String>((status, status))
+    })
+    .await?;
+    if !status.success() {
+        return Err("yt-dlp exited with an error".into());
+    }
+    Ok(())
+}
+
+/// Abort on cancellation as well as on early errors; a detached stderr reader
+/// must never edit a later attempt's progress message.
+struct ProgressStderrTask(tokio::task::JoinHandle<()>);
+impl Drop for ProgressStderrTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn download_progress_attempt(
+    url: &str,
+    output: &Path,
+    format_args: &[&str],
+    metadata_args: &[&str],
+    bot: &Bot,
+    chat_id: ChatId,
+    msg_id: MessageId,
+) -> Result<std::process::ExitStatus, String> {
     let mut cmd = tokio::process::Command::new("yt-dlp");
     cmd.args(format_args).args(metadata_args).args([
         "--newline",
@@ -2183,10 +2234,19 @@ async fn download_with_progress(
     // X guest-token extraction works without authentication. Stale browser
     // cookies can instead make its GraphQL endpoint reject the request.
     if should_use_cookies(url) {
-        cookie_refresh::refresh_if_configured().await;
         add_cookie_args(&mut cmd);
     }
-    cmd.stdout(std::process::Stdio::piped())
+    download_progress_command(cmd, bot, chat_id, msg_id).await
+}
+
+async fn download_progress_command(
+    mut cmd: tokio::process::Command,
+    bot: &Bot,
+    chat_id: ChatId,
+    msg_id: MessageId,
+) -> Result<std::process::ExitStatus, String> {
+    cmd.kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
     let mut child = cmd
@@ -2198,7 +2258,7 @@ async fn download_with_progress(
     let stderr = child.stderr.take().unwrap();
     let stderr_bot = bot.clone();
     let stderr_extract_notified = Arc::clone(&extract_notified);
-    tokio::spawn(async move {
+    let mut stderr_task = ProgressStderrTask(tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             log::warn!("[yt-dlp stderr] {}", line);
@@ -2211,7 +2271,7 @@ async fn download_with_progress(
                     .ok();
             }
         }
-    });
+    }));
 
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout).lines();
@@ -2254,30 +2314,49 @@ async fn download_with_progress(
         .await
         .map_err(|e| format!("yt-dlp error: {e}"))?;
 
-    if !status.success() {
-        return Err("yt-dlp exited with an error".into());
+    // Drain normal stderr, but do not let a stalled Telegram edit (or inherited
+    // pipe) keep the task alive into a retry. Await abort before another attempt.
+    if tokio::time::timeout(Duration::from_secs(2), &mut stderr_task.0)
+        .await
+        .is_err()
+    {
+        stderr_task.0.abort();
+        let _ = (&mut stderr_task.0).await;
     }
-
-    Ok(())
+    Ok(status)
 }
 
 async fn fetch_metadata_field(url: &str, field: &str) -> Option<String> {
-    let mut cmd = tokio::process::Command::new("yt-dlp");
-    cmd.args([
-        "--print",
-        field,
-        "--no-download",
-        "--js-runtimes",
-        "node",
-        "--remote-components",
-        "ejs:github",
-        url,
-    ]);
-    if should_use_cookies(url) {
+    let use_cookies = should_use_cookies(url);
+    if use_cookies {
         cookie_refresh::refresh_if_configured().await;
-        add_cookie_args(&mut cmd);
     }
-    let output = cmd.output().await.ok()?;
+    let output = cookie_refresh::run_output(
+        || {
+            let mut cmd = tokio::process::Command::new("yt-dlp");
+            cmd.args([
+                "--print",
+                field,
+                "--no-download",
+                "--js-runtimes",
+                "node",
+                "--remote-components",
+                "ejs:github",
+                url,
+            ]);
+            if use_cookies {
+                add_cookie_args(&mut cmd);
+            }
+            cmd
+        },
+        use_cookies,
+        None,
+    )
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
     let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if title.is_empty() {
         None

@@ -6,6 +6,11 @@
 !/Cargo.toml
 !/Cargo.lock
 !/compose.yaml
+!/README.md
+!/cookie_bridge/
+!/cookie_bridge/**
+/cookie_bridge/__pycache__/
+/cookie_bridge/*.pyc
 
 # Keep source files.
 !/src/

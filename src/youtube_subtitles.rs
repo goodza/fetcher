@@ -18,6 +18,7 @@ pub(super) struct SubtitleTrack {
 }
 
 pub(super) async fn available_tracks(url: &str) -> Result<Vec<SubtitleTrack>, String> {
+    super::cookie_refresh::refresh_if_configured().await;
     let output = run_command(
         discovery_command(url),
         DISCOVERY_TIMEOUT,
@@ -38,6 +39,7 @@ pub(super) async fn download(
     if !valid_language(&track.language) {
         return Err("Invalid subtitle language selection.".into());
     }
+    super::cookie_refresh::refresh_if_configured().await;
     std::fs::create_dir_all(work_dir)
         .map_err(|_| "Could not create the subtitle working directory.".to_string())?;
     let root = std::fs::canonicalize(work_dir)

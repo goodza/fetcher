@@ -18,6 +18,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::Instant;
 use uuid::Uuid;
 
+mod cookie_refresh;
 mod subtitle_ui;
 mod youtube_subtitles;
 
@@ -79,6 +80,7 @@ async fn main() {
     }
     pretty_env_logger::init_timed();
     log::info!("Starting fetcher bot v{}...", env!("CARGO_PKG_VERSION"));
+    cookie_refresh::refresh_if_configured().await;
     check_cookies().await;
 
     let token = std::env::var("TG_TOKEN").expect("TG_TOKEN must be set");
@@ -949,6 +951,7 @@ async fn fetch_instagram_post_photo_urls(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<(String, Vec<String>), String> {
+    cookie_refresh::refresh_if_configured().await;
     let shortcode = instagram_post_shortcode(url)
         .ok_or_else(|| "Cannot determine the Instagram post shortcode".to_string())?;
     let embed_url = format!("https://www.instagram.com/p/{shortcode}/embed/captioned/");
@@ -1163,6 +1166,7 @@ async fn initialize_instagram_webdriver_session(
     )
     .await?;
 
+    cookie_refresh::refresh_if_configured().await;
     for cookie in instagram_webdriver_cookies() {
         if let Err(error) = webdriver_json(
             client,
@@ -2179,6 +2183,7 @@ async fn download_with_progress(
     // X guest-token extraction works without authentication. Stale browser
     // cookies can instead make its GraphQL endpoint reject the request.
     if should_use_cookies(url) {
+        cookie_refresh::refresh_if_configured().await;
         add_cookie_args(&mut cmd);
     }
     cmd.stdout(std::process::Stdio::piped())
@@ -2269,6 +2274,7 @@ async fn fetch_metadata_field(url: &str, field: &str) -> Option<String> {
         url,
     ]);
     if should_use_cookies(url) {
+        cookie_refresh::refresh_if_configured().await;
         add_cookie_args(&mut cmd);
     }
     let output = cmd.output().await.ok()?;

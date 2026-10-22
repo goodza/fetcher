@@ -29,6 +29,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Test cookie bridge
+        run: python3 -m unittest discover -s cookie_bridge -v
+
       - name: Test
         run: cargo test --locked
 
@@ -70,7 +73,8 @@ jobs:
           remote_new="${REMOTE_DIR}/fetcher.new-${GITHUB_SHA}"
           local_sha=$(sha256sum target/release/fetcher | cut -d' ' -f1)
 
-          ssh "${ssh_args[@]}" "$destination" "mkdir -p '${REMOTE_DIR}'"
+          ssh "${ssh_args[@]}" "$destination" "mkdir -p '${REMOTE_DIR}/cookie_bridge'"
+          scp "${scp_args[@]}" cookie_bridge/refresh.py "${destination}:${REMOTE_DIR}/cookie_bridge/refresh.py"
           scp "${scp_args[@]}" target/release/fetcher "${destination}:${remote_new}"
           scp "${scp_args[@]}" compose.yaml "${destination}:${REMOTE_DIR}/compose.yaml"
           remote_sha=$(

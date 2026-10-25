@@ -112,8 +112,12 @@ jobs:
             source "$remote_dir/.env"
             set +a
             : "${TG_TOKEN:?TG_TOKEN must be set in .env}"
+            # Keep the token-bearing URL out of curl's process arguments.
             if ! logout_response=$(curl --fail --silent --show-error --request POST \
-              "https://api.telegram.org/bot${TG_TOKEN}/logOut"); then
+              --config - <<CURL_CONFIG
+          url = "https://api.telegram.org/bot${TG_TOKEN}/logOut"
+          CURL_CONFIG
+            ); then
               pm2 restart "$app" --update-env >/dev/null || true
               echo "Telegram cloud Bot API logout request failed" >&2
               exit 1

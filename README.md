@@ -65,6 +65,11 @@ Concurrent requests share one refresh; successful refreshes are cached for ten
 minutes, failures back off for one minute. Refresh failures retain the last good
 `cookies.txt`, so the PC being offline does not immediately break downloads.
 The response is bounded and validated before an atomic mode-600 replacement.
+Before reusing that ten-minute cache, fetcher checks that the local jar still
+contains unexpired Instagram and YouTube/Google login cookies. If yt-dlp has
+removed rejected credentials, the next operation requests fresh PC cookies through
+the same tunnel immediately. This recovery shares the forced-refresh limit of
+one attempt per minute, so repeated rejection cannot hammer the PC webhook.
 
 If a cookie-using yt-dlp operation exits with an error, fetcher requests a forced
 refresh, bypassing the ten-minute success cache, and retries that operation

@@ -39,7 +39,19 @@ impl RefreshState {
 
     async fn refresh(&mut self, config: &Config, timeout: Duration) -> Option<bool> {
         if self.next_attempt.is_some_and(|next| Instant::now() < next) {
-            return None;
+            if self
+                .failure_until
+                .is_some_and(|until| Instant::now() < until)
+                || has_current_logins(&config.cookies_file)
+            {
+                return None;
+            }
+            // yt-dlp may rewrite the jar and remove invalidated login cookies.
+            // Reuse the bounded forced-refresh policy instead of trusting TTL alone.
+            return Some(
+                self.refresh_after_error(config, timeout, Instant::now())
+                    .await,
+            );
         }
         Some(self.update(config, timeout).await)
     }
@@ -290,6 +302,41 @@ fn read_limited(path: &Path, limit: usize) -> Result<Vec<u8>, ()> {
     Ok(contents)
 }
 
+fn has_current_logins(path: &Path) -> bool {
+    let Ok(contents) = read_limited(path, MAX_BODY) else {
+        return false;
+    };
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (mut instagram, mut youtube) = (false, false);
+    for row in contents.lines() {
+        if row.is_empty() || (row.starts_with('#') && !row.starts_with("#HttpOnly_")) {
+            continue;
+        }
+        let Ok(fields) = cookie_fields(row) else {
+            return false;
+        };
+        let expiry = fields[4].parse::<u64>().unwrap_or_default();
+        if fields[6].is_empty() || (expiry != 0 && expiry <= now) {
+            continue;
+        }
+        let domain = fields[0].trim_start_matches('.');
+        instagram |= (domain == "instagram.com" || domain.ends_with(".instagram.com"))
+            && fields[5] == "sessionid";
+        youtube |= (domain == "youtube.com"
+            || domain.ends_with(".youtube.com")
+            || domain == "google.com"
+            || domain.ends_with(".google.com"))
+            && matches!(fields[5], "SID" | "__Secure-1PSID" | "__Secure-3PSID");
+    }
+    instagram && youtube
+}
+
 fn relevant_domain(domain: &str) -> bool {
     let domain = domain.strip_prefix('.').unwrap_or(domain);
     ["instagram.com", "youtube.com", "google.com"]
@@ -517,6 +564,46 @@ mod tests {
                 .refresh_after_error(&config, TIMEOUT, Instant::now())
                 .await
         );
+    }
+
+    #[test]
+    fn local_login_health_checks_expiry_and_missing_credentials() {
+        let directory = Directory::new();
+        let path = directory.0.join("cookies.txt");
+        assert!(!has_current_logins(&path));
+        for invalid in [
+            GOOD.replace("\t0\t", "\t1\t"),
+            GOOD.replace("__Secure-1PSID", "VISITOR_INFO1_LIVE"),
+            GOOD.replace("sessionid", "other"),
+            GOOD.replace("fixture-yt", ""),
+            GOOD.replace(".youtube.com", ".notyoutube.com"),
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(!has_current_logins(&path));
+        }
+        std::fs::write(&path, GOOD).unwrap();
+        assert!(has_current_logins(&path));
+    }
+
+    #[tokio::test]
+    async fn stripped_local_logins_refresh_during_ttl_with_bounded_retries() {
+        let directory = Directory::new();
+        let (url, initial) = server("200 OK", GOOD.into(), Duration::ZERO);
+        let mut config = directory.config(url);
+        let mut state = RefreshState::new();
+        assert_eq!(state.refresh(&config, TIMEOUT).await, Some(true));
+        initial.join().unwrap();
+        // Simulate yt-dlp discarding rejected authentication before TTL expires.
+        std::fs::write(&config.cookies_file, "# Netscape HTTP Cookie File\n").unwrap();
+        let (url, refreshed) = server("200 OK", GOOD.into(), Duration::ZERO);
+        config.url = url;
+        assert_eq!(state.refresh(&config, TIMEOUT).await, Some(true));
+        refreshed.join().unwrap();
+        assert!(has_current_logins(&config.cookies_file));
+        assert_eq!(state.refresh(&config, TIMEOUT).await, None);
+        std::fs::remove_file(&config.cookies_file).unwrap();
+        // A repeatedly rejected session must not hammer the PC webhook.
+        assert_eq!(state.refresh(&config, TIMEOUT).await, Some(false));
     }
 
     #[tokio::test]

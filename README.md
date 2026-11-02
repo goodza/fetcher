@@ -1,6 +1,7 @@
 # Fetcher 0.1.4
 
-Rust Telegram media downloader. Run `cargo test --locked`, then
+Rust Telegram media downloader. Requires Rust 1.96 or newer for the locked
+dependencies (`rustup update stable` to update). Run `cargo test --locked`, then
 `cargo build --release --locked`. Pushing `main` runs the gsweb deployment workflow
 and restarts the production bot.
 

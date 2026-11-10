@@ -852,28 +852,62 @@ fn best_instagram_photo_url(node: &serde_json::Value) -> Option<&str> {
         .get("is_video")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+        || node.get("media_type").and_then(serde_json::Value::as_u64) == Some(2)
+        || node
+            .get("video_versions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|videos| !videos.is_empty())
     {
         return None;
     }
 
-    node.get("display_resources")
+    node.get("image_versions2")
+        .and_then(|versions| versions.get("candidates"))
         .and_then(serde_json::Value::as_array)
-        .and_then(|resources| {
-            resources.iter().max_by_key(|resource| {
-                let width = resource
-                    .get("config_width")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
-                let height = resource
-                    .get("config_height")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
-                width.saturating_mul(height)
-            })
+        .and_then(|candidates| {
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+                })
+                .max_by_key(|candidate| {
+                    candidate
+                        .get("width")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default()
+                        .saturating_mul(
+                            candidate
+                                .get("height")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or_default(),
+                        )
+                })
         })
-        .and_then(|resource| resource.get("src"))
+        .and_then(|candidate| candidate.get("url"))
         .and_then(serde_json::Value::as_str)
-        .or_else(|| node.get("display_url").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            node.get("display_resources")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|resources| {
+                    resources.iter().max_by_key(|resource| {
+                        let width = resource
+                            .get("config_width")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default();
+                        let height = resource
+                            .get("config_height")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default();
+                        width.saturating_mul(height)
+                    })
+                })
+                .and_then(|resource| resource.get("src"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| node.get("display_url").and_then(serde_json::Value::as_str))
+        })
 }
 
 fn collect_instagram_post_photos(
@@ -884,8 +918,9 @@ fn collect_instagram_post_photos(
 ) {
     match value {
         serde_json::Value::Object(object) => {
-            let is_target =
-                object.get("shortcode").and_then(serde_json::Value::as_str) == Some(shortcode);
+            let is_target = ["shortcode", "code"]
+                .iter()
+                .any(|key| object.get(*key).and_then(serde_json::Value::as_str) == Some(shortcode));
             if is_target {
                 if let Some(edges) = object
                     .get("edge_sidecar_to_children")
@@ -893,6 +928,17 @@ fn collect_instagram_post_photos(
                     .and_then(serde_json::Value::as_array)
                 {
                     for node in edges.iter().filter_map(|edge| edge.get("node")) {
+                        if let Some(url) = best_instagram_photo_url(node) {
+                            if seen.insert(url.to_string()) {
+                                photos.push(url.to_string());
+                            }
+                        }
+                    }
+                } else if let Some(items) = object
+                    .get("carousel_media")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for node in items {
                         if let Some(url) = best_instagram_photo_url(node) {
                             if seen.insert(url.to_string()) {
                                 photos.push(url.to_string());
@@ -944,6 +990,19 @@ fn extract_instagram_post_photo_urls(html: &str, shortcode: &str) -> Vec<String>
         cursor = start;
     }
 
+    // Modern pages deliver Relay data as JSON script elements instead of ServerJS calls.
+    static JSON_SCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)<script\b[^>]*\btype\s*=\s*["']application/json["'][^>]*>(.*?)</script\s*>"#,
+        )
+        .unwrap()
+    });
+    for script in JSON_SCRIPT_RE.captures_iter(html) {
+        if let Ok(value) = serde_json::from_str(&script[1]) {
+            collect_instagram_post_photos(&value, shortcode, &mut photos, &mut seen);
+        }
+    }
+
     photos
 }
 
@@ -954,33 +1013,38 @@ async fn fetch_instagram_post_photo_urls(
     cookie_refresh::refresh_if_configured().await;
     let shortcode = instagram_post_shortcode(url)
         .ok_or_else(|| "Cannot determine the Instagram post shortcode".to_string())?;
-    let embed_url = format!("https://www.instagram.com/p/{shortcode}/embed/captioned/");
-    let mut request = client
-        .get(embed_url)
-        .header(reqwest::header::USER_AGENT, "Mozilla/5.0")
-        .header(reqwest::header::REFERER, "https://www.instagram.com/");
-    if let Some(cookies) = instagram_cookie_header() {
-        request = request.header(reqwest::header::COOKIE, cookies);
+    let cookies = instagram_cookie_header();
+    for page_url in [
+        format!("https://www.instagram.com/p/{shortcode}/embed/captioned/"),
+        format!("https://www.instagram.com/p/{shortcode}/"),
+    ] {
+        let mut request = client
+            .get(page_url)
+            .header(reqwest::header::USER_AGENT, "Mozilla/5.0")
+            .header(reqwest::header::REFERER, "https://www.instagram.com/");
+        if let Some(cookies) = &cookies {
+            request = request.header(reqwest::header::COOKIE, cookies);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("Cannot open Instagram post: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("Instagram post returned HTTP {status}"));
+        }
+        let html = response
+            .text()
+            .await
+            .map_err(|e| format!("Cannot read Instagram post: {e}"))?;
+        let photos = extract_instagram_post_photo_urls(&html, shortcode);
+        if !photos.is_empty() {
+            return Ok((shortcode.to_string(), photos));
+        }
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Cannot open Instagram post: {e}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("Instagram post returned HTTP {status}"));
-    }
-    let html = response
-        .text()
-        .await
-        .map_err(|e| format!("Cannot read Instagram post: {e}"))?;
-    let photos = extract_instagram_post_photo_urls(&html, shortcode);
-    if photos.is_empty() {
-        return Err(NO_INSTAGRAM_POST_PHOTOS.into());
-    }
-
-    Ok((shortcode.to_string(), photos))
+    Err(NO_INSTAGRAM_POST_PHOTOS.into())
 }
 
 async fn send_instagram_photo_batch(
@@ -2925,6 +2989,74 @@ mod tests {
             extract_instagram_post_photo_urls(&html, "SINGLE123"),
             vec!["https://cdn.example/single.jpg"]
         );
+    }
+
+    #[test]
+    fn finds_single_photo_post_with_obrf_share_query() {
+        let url = "https://www.instagram.com/p/Dfgv53mT_8K/?obrf=MXN2cHI1Z2RocDRxYw==";
+        let link = find_download_link(url).expect("photo post should be detected");
+        assert!(matches!(link.kind, DownloadKind::InstagramPost));
+        assert_eq!(link.url, url);
+        assert_eq!(instagram_post_shortcode(link.url), Some("Dfgv53mT_8K"));
+    }
+
+    #[test]
+    fn extracts_single_photo_from_modern_relay_script() {
+        let post = serde_json::json!({
+            "code": "Dfgv53mT_8K",
+            "media_type": 1,
+            "image_versions2": {"candidates": [
+                {"url": "https://cdn.example/small.jpg", "width": 320, "height": 400},
+                {"url": "https://cdn.example/full.jpg?a=1&b=2", "width": 1080, "height": 1350}
+            ]}
+        });
+        let payload = serde_json::json!({"data": {"items": [post, {
+            "code": "UNRELATED", "media_type": 1,
+            "display_url": "https://cdn.example/unrelated.jpg"
+        }]}});
+        let html = format!("<script type=\"application/json\" data-sjs>{payload}</script>");
+        assert_eq!(
+            extract_instagram_post_photo_urls(&html, "Dfgv53mT_8K"),
+            vec!["https://cdn.example/full.jpg?a=1&b=2"]
+        );
+    }
+
+    #[test]
+    fn modern_carousel_skips_video_covers_and_deduplicates_photos() {
+        let photo = serde_json::json!({"media_type": 1, "image_versions2": {
+            "candidates": [{"url": "https://cdn.example/photo.jpg", "width": 1080, "height": 1080}]
+        }});
+        let post = serde_json::json!({
+            "code": "CAROUSEL", "media_type": 8,
+            "display_url": "https://cdn.example/cover.jpg",
+            "carousel_media": [
+                {"media_type": 2, "display_url": "https://cdn.example/video.jpg"},
+                photo,
+                {"media_type": 1, "display_url": "https://cdn.example/second.jpg"}
+            ]
+        });
+        let html = format!(
+            "<script>s.handle({post});</script><script type='application/json'>{post}</script>"
+        );
+        assert_eq!(
+            extract_instagram_post_photo_urls(&html, "CAROUSEL"),
+            vec![
+                "https://cdn.example/photo.jpg",
+                "https://cdn.example/second.jpg"
+            ]
+        );
+    }
+
+    #[test]
+    fn video_only_post_does_not_return_thumbnail() {
+        for post in [
+            serde_json::json!({"code": "VIDEO", "media_type": 2, "display_url": "cover.jpg"}),
+            serde_json::json!({"shortcode": "VIDEO", "is_video": true, "display_url": "cover.jpg"}),
+            serde_json::json!({"code": "VIDEO", "video_versions": [{"url": "video.mp4"}], "display_url": "cover.jpg"}),
+        ] {
+            let html = format!("<script type='application/json'>{post}</script>");
+            assert!(extract_instagram_post_photo_urls(&html, "VIDEO").is_empty());
+        }
     }
 
     #[test]

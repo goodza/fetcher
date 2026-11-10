@@ -5,6 +5,15 @@ dependencies (`rustup update stable` to update). Run `cargo test --locked`, then
 `cargo build --release --locked`. Pushing `main` runs the gsweb deployment workflow
 and restarts the production bot.
 
+## Instagram photos
+
+Send an Instagram `/p/<shortcode>/` link (including shared links with `?obrf=...`)
+for a single picture or photo carousel. The bot selects the largest available
+images, skips videos, and sends photos directly to Telegram. Both legacy embed
+payloads and modern JSON page data are supported; if the embed has no photos,
+the bot tries the canonical post page. Private posts or login/challenge pages
+may still require valid Instagram cookies.
+
 ## Firefox cookie bridge
 
 The PC runs a dependency-free Python webhook under PM2. It snapshots the live

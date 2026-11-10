@@ -7,6 +7,8 @@
 !/Cargo.lock
 !/compose.yaml
 !/README.md
+!/goal-and-requirements.md
+!/architecture.md
 !/cookie_bridge/
 !/cookie_bridge/**
 /cookie_bridge/__pycache__/

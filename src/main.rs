@@ -1006,6 +1006,91 @@ fn extract_instagram_post_photo_urls(html: &str, shortcode: &str) -> Vec<String>
     photos
 }
 
+fn instagram_photo_from_yt_dlp(info: &serde_json::Value, shortcode: &str) -> Option<String> {
+    // Only use thumbnails as photos for a single, format-less post. A video's
+    // thumbnail (or a playlist cover) must never be sent as the requested photo.
+    if info.get("id").and_then(serde_json::Value::as_str) != Some(shortcode)
+        || info.get("entries").is_some()
+        || info
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        || info
+            .get("formats")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|formats| !formats.is_empty())
+        || info
+            .get("duration")
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|duration| duration > 0.0)
+    {
+        return None;
+    }
+    // yt-dlp orders thumbnails from worst to best. Preserve that order when
+    // Instagram does not supply explicit dimensions (as on single-photo posts).
+    info.get("thumbnails")?
+        .as_array()?
+        .iter()
+        .filter_map(|thumbnail| {
+            let url = thumbnail.get("url")?.as_str()?;
+            let parsed = reqwest::Url::parse(url).ok()?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return None;
+            }
+            let area = thumbnail
+                .get("width")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                .saturating_mul(
+                    thumbnail
+                        .get("height")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default(),
+                );
+            Some((area, url))
+        })
+        .max_by_key(|(area, _)| *area)
+        .map(|(_, url)| url.to_string())
+}
+
+async fn fetch_instagram_photo_with_yt_dlp(url: &str, shortcode: &str) -> Option<String> {
+    let output = cookie_refresh::run_output(
+        || {
+            let mut cmd = tokio::process::Command::new("yt-dlp");
+            cmd.args([
+                "--ignore-config",
+                "--dump-single-json",
+                "--skip-download",
+                "--ignore-no-formats-error",
+                "--no-playlist",
+                "--socket-timeout",
+                "20",
+                "--retries",
+                "1",
+                "--extractor-retries",
+                "1",
+                url,
+            ]);
+            // Public photo extraction works without a browser session. Use the
+            // configured jar if present, but do not require a local browser.
+            if cookie_file_path().is_some() {
+                add_cookie_args(&mut cmd);
+            }
+            cmd.kill_on_drop(true);
+            cmd
+        },
+        cookie_file_path().is_some(),
+        Some(Duration::from_secs(90)),
+    )
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let info = serde_json::from_slice(&output.stdout).ok()?;
+    instagram_photo_from_yt_dlp(&info, shortcode)
+}
+
 async fn fetch_instagram_post_photo_urls(
     client: &reqwest::Client,
     url: &str,
@@ -1013,6 +1098,9 @@ async fn fetch_instagram_post_photo_urls(
     cookie_refresh::refresh_if_configured().await;
     let shortcode = instagram_post_shortcode(url)
         .ok_or_else(|| "Cannot determine the Instagram post shortcode".to_string())?;
+    if let Some(photo) = fetch_instagram_photo_with_yt_dlp(url, shortcode).await {
+        return Ok((shortcode.to_string(), vec![photo]));
+    }
     let cookies = instagram_cookie_header();
     for page_url in [
         format!("https://www.instagram.com/p/{shortcode}/embed/captioned/"),
@@ -2989,6 +3077,70 @@ mod tests {
             extract_instagram_post_photo_urls(&html, "SINGLE123"),
             vec!["https://cdn.example/single.jpg"]
         );
+    }
+
+    #[test]
+    fn yt_dlp_photo_uses_best_thumbnail_even_without_dimensions() {
+        let info = serde_json::json!({"id": "PHOTO", "formats": [], "thumbnails": [
+            {"url": "https://cdn.example/small.jpg"},
+            {"url": "https://cdn.example/original.jpg"}
+        ]});
+        assert_eq!(
+            instagram_photo_from_yt_dlp(&info, "PHOTO"),
+            Some("https://cdn.example/original.jpg".into())
+        );
+        assert!(instagram_photo_from_yt_dlp(&info, "OTHER").is_none());
+        let info = serde_json::json!({"id": "PHOTO", "thumbnails": [
+            {"url": "https://cdn.example/full.jpg", "width": 1088, "height": 1440},
+            {"url": "https://cdn.example/small.jpg", "width": 150, "height": 150},
+            {"url": "file:///etc/passwd"}
+        ]});
+        assert_eq!(
+            instagram_photo_from_yt_dlp(&info, "PHOTO"),
+            Some("https://cdn.example/full.jpg".into())
+        );
+    }
+
+    #[test]
+    fn yt_dlp_video_and_playlist_thumbnails_are_not_photos() {
+        for extra in [
+            serde_json::json!({"formats": [{"url": "https://cdn.example/video.mp4"}]}),
+            serde_json::json!({"url": "https://cdn.example/video.mp4"}),
+            serde_json::json!({"duration": 12.0}),
+            serde_json::json!({"entries": []}),
+        ] {
+            let mut info = serde_json::json!({"id": "PHOTO", "thumbnails": [{"url": "https://cdn.example/cover.jpg"}]});
+            info.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(instagram_photo_from_yt_dlp(&info, "PHOTO").is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Instagram access and yt-dlp"]
+    async fn live_yt_dlp_single_instagram_photo() {
+        let photo = fetch_instagram_photo_with_yt_dlp(
+            "https://www.instagram.com/p/Dfgv53mT_8K/?obrf=MXN2cHI1Z2RocDRxYw==",
+            "Dfgv53mT_8K",
+        )
+        .await
+        .expect("yt-dlp should extract the original photo");
+        let response = reqwest::Client::new()
+            .get(photo)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert!(response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("image/"));
+        assert!(!response.bytes().await.unwrap().is_empty());
     }
 
     #[test]

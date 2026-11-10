@@ -9,9 +9,13 @@ and restarts the production bot.
 
 Send an Instagram `/p/<shortcode>/` link (including shared links with `?obrf=...`)
 for a single picture or photo carousel. The bot selects the largest available
-images, skips videos, and sends photos directly to Telegram. Both legacy embed
-payloads and modern JSON page data are supported; if the embed has no photos,
-the bot tries the canonical post page. Private posts or login/challenge pages
+images, skips videos, and sends photos directly to Telegram. For single photos,
+the bot first uses yt-dlp with `--ignore-no-formats-error` to retrieve the original
+image from its thumbnail metadata (ordinary yt-dlp downloads report "There is no
+video in this post"). Video and playlist covers are excluded from this path.
+Legacy embed payloads and modern JSON page data remain fallbacks for photo
+extraction, including carousels; if the embed has no photos, the bot tries the
+canonical post page. Private posts or login/challenge pages
 may still require valid Instagram cookies.
 
 ## Firefox cookie bridge

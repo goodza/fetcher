@@ -1,7 +1,7 @@
 ---
 id: fetcher-architecture
 type: architecture-design
-status: draft
+status: active
 title: Fetcher architecture and operating boundaries
 parent: fetcher-goals
 ---
@@ -44,6 +44,6 @@ GitHub pushes to `main` and manual workflow dispatch run Python tests, Rust test
 
 ## Evidence and documentation drift
 
-The implementation, tests, Cargo manifest, Compose file, workflow, and README inform these draft specs. No existing durable design document was adopted. README remains operational input; the local Android implementation plan is not a spec.
+The implementation, tests, Cargo manifest, Compose file, workflow, and README inform these specs. No existing durable design document was adopted. README remains operational input; the local Android implementation plan is not a spec.
 
 The ignored local `CLAUDE.md` describes an Instagram-Reels-only `teloxide::repl` bot using `TELOXIDE_TOKEN` and says all logic is in `main.rs`. Current code instead uses a dispatcher, `TG_TOKEN`, additional modules, and the capabilities in `fetcher-goals`. Those stale statements are corrected in this graph; the ignored agent file itself is unchanged.

@@ -1,7 +1,7 @@
 ---
 id: fetcher-goals
 type: goal-and-requirements
-status: draft
+status: active
 title: Fetcher goals and requirements
 ---
 
@@ -39,4 +39,4 @@ The user confirmed that pending work and menus are in memory and are lost on res
 
 ## Spec map
 
-`fetcher-architecture` owns topology, dependency edges, and deployment assumptions. `fetcher-bot` and `fetcher-cookie-bridge` own their respective runtime contracts. All specs remain draft until user review.
+`fetcher-architecture` owns topology, dependency edges, and deployment assumptions. `fetcher-bot` and `fetcher-cookie-bridge` own their respective runtime contracts. Unconfirmed statements remain explicitly marked; approval of the graph does not independently verify them.

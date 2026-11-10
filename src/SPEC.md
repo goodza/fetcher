@@ -1,7 +1,7 @@
 ---
 id: fetcher-bot
 type: module-design
-status: draft
+status: active
 title: Fetcher bot runtime and media contracts
 parent: fetcher-architecture
 depends-on: [fetcher-cookie-bridge]

@@ -1,7 +1,7 @@
 ---
 id: fetcher-cookie-bridge
 type: module-design
-status: draft
+status: active
 title: Private Firefox cookie export bridge
 parent: fetcher-architecture
 ---
